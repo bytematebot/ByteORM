@@ -23,8 +23,6 @@ pub fn generate_jsonb_accessor_fields(
 
 pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
     let model_name_str = &model.name;
-    let query_builder = format_ident!("{}Query", model.name);
-    let where_builder_name = format_ident!("{}WhereBuilder", model.name);
     let table_name = &model.table_name;
 
     let pk_fields: Vec<_> = model
@@ -61,11 +59,8 @@ pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
     jsonb_fields.into_iter().map(|jsonb| {
         let jsonb_name = &jsonb.name;
         let jsonb_snake = to_snake_case(jsonb_name);
-        let jsonb_field_ident = format_ident!("{}", jsonb_name);
         let sub_accessor_struct = format_ident!("{}{}Accessor", model.name, capitalize_first(jsonb_name));
         let defaults_const = format_ident!("{}_DEFAULTS", jsonb_snake.to_uppercase());
-
-        let is_nullable = jsonb.modifiers.iter().any(|m| matches!(m, Modifier::Nullable));
 
         let json_content = jsonb.attributes.iter()
             .find(|a| a.name == "jsonb_default")
@@ -86,16 +81,11 @@ pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
             }
         };
 
-        let (pk_params, pk_where_methods, pk_args_for_set) = if pk_fields.len() == 1 {
+        let (pk_params, pk_args_for_set) = if pk_fields.len() == 1 {
             let pk = &pk_fields[0];
             let is_pk_nullable = pk.modifiers.iter().any(|m| matches!(m, Modifier::Nullable));
             let pk_type = rust_type_from_schema(&pk.type_name, is_pk_nullable);
-            let pk_field_name = format_ident!("where_{}", to_snake_case(&pk.name));
-            (
-                quote! { id: #pk_type },
-                quote! { .#pk_field_name(id) },
-                vec![quote! { &id }],
-            )
+            (quote! { id: #pk_type }, vec![quote! { &id }])
         } else {
             let params = pk_fields.iter().map(|pk| {
                 let param_name = format_ident!("{}", to_snake_case(&pk.name));
@@ -103,31 +93,19 @@ pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
                 let pk_type = rust_type_from_schema(&pk.type_name, is_pk_nullable);
                 quote! { #param_name: #pk_type }
             });
-            let where_methods = pk_fields.iter().map(|pk| {
-                let method_name = format_ident!("where_{}", to_snake_case(&pk.name));
-                let param_name = format_ident!("{}", to_snake_case(&pk.name));
-                quote! { .#method_name(#param_name) }
-            });
             let set_args = pk_fields.iter().map(|pk| {
                 let param_name = format_ident!("{}", to_snake_case(&pk.name));
                 quote! { &#param_name }
             });
-            (
-                quote! { #(#params),* },
-                quote! { #(#where_methods)* },
-                set_args.collect::<Vec<_>>(),
-            )
+            (quote! { #(#params),* }, set_args.collect::<Vec<_>>())
         };
 
-        let (pk_field_type, pk_field_ident, pk_field_name_in) = if pk_fields.len() == 1 {
+        let pk_field_type = if pk_fields.len() == 1 {
             let pk = &pk_fields[0];
             let is_pk_nullable = pk.modifiers.iter().any(|m| matches!(m, Modifier::Nullable));
-            let pk_type = rust_type_from_schema(&pk.type_name, is_pk_nullable);
-            let pk_ident = format_ident!("{}", to_snake_case(&pk.name));
-            let pk_method_in = format_ident!("where_{}_in", to_snake_case(&pk.name));
-            (pk_type, pk_ident, pk_method_in)
+            rust_type_from_schema(&pk.type_name, is_pk_nullable)
         } else {
-            (quote! { () }, format_ident!("_unused"), format_ident!("_unused"))
+            quote! { () }
         };
 
         let pk_args_clone = if pk_fields.len() == 1 {
@@ -147,142 +125,22 @@ pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
         let key_placeholder = format!("${}", pk_columns.len() + 1);
         let value_placeholder = format!("${}", pk_columns.len() + 2);
 
-        let get_all_body = if is_nullable {
-            quote! {
-                Ok(Some(record)) => Ok(record.#jsonb_field_ident.clone().unwrap_or_else(|| #defaults_const.clone())),
-            }
-        } else {
-            quote! {
-                Ok(Some(record)) => Ok(record.#jsonb_field_ident.clone()),
-            }
-        };
-
-        let get_body = if is_nullable {
-            quote! {
-                Ok(Some(record)) => {
-                    if let Some(ref jsonb_val) = record.#jsonb_field_ident {
-                        jsonb_val.get_string(key)
-                            .or_else(|_| #defaults_const.get_string(key))
-                    } else {
-                        #defaults_const.get_string(key)
-                    }
-                },
-            }
-        } else {
-            quote! {
-                Ok(Some(record)) => {
-                    record.#jsonb_field_ident.get_string(key)
-                        .or_else(|_| #defaults_const.get_string(key))
-                },
-            }
-        };
-
-        let get_as_body = if is_nullable {
-            quote! {
-                Ok(Some(record)) => {
-                    if let Some(ref jsonb_val) = record.#jsonb_field_ident {
-                        jsonb_val.get_value(key)
-                            .or_else(|_| #defaults_const.get_value(key))
-                    } else {
-                        #defaults_const.get_value(key)
-                    }
-                },
-            }
-        } else {
-            quote! {
-                Ok(Some(record)) => {
-                    record.#jsonb_field_ident.get_value(key)
-                        .or_else(|_| #defaults_const.get_value(key))
-                },
-            }
-        };
-
-        let has_body = if is_nullable {
-            quote! {
-                Ok(Some(record)) => {
-                    if let Some(ref jsonb_val) = record.#jsonb_field_ident {
-                        Ok(jsonb_val.has_key(key) || #defaults_const.has_key(key))
-                    } else {
-                        Ok(#defaults_const.has_key(key))
-                    }
-                },
-            }
-        } else {
-            quote! {
-                Ok(Some(record)) => Ok(record.#jsonb_field_ident.has_key(key) || #defaults_const.has_key(key)),
-            }
-        };
-
-        let get_many_for_loop = if is_nullable {
-            quote! {
-                if let Some(record) = opt {
-                    if let Some(ref jsonb_val) = record.#jsonb_field_ident {
-                        for &key in keys {
-                            if let Some(v) = jsonb_val.get(key) {
-                                out.insert(key.to_string(), v.clone());
-                            } else if let Some(v) = #defaults_const.get(key) {
-                                out.insert(key.to_string(), v.clone());
-                            }
-                        }
-                    } else {
-                        for &key in keys {
-                            if let Some(v) = #defaults_const.get(key) {
-                                out.insert(key.to_string(), v.clone());
-                            }
-                        }
-                    }
-                } else {
-                    for &key in keys {
-                        if let Some(v) = #defaults_const.get(key) {
-                            out.insert(key.to_string(), v.clone());
-                        }
-                    }
-                }
-            }
-        } else {
-            quote! {
-                if let Some(record) = opt {
-                    for &key in keys {
-                        if let Some(v) = record.#jsonb_field_ident.get(key) {
-                            out.insert(key.to_string(), v.clone());
-                        } else if let Some(v) = #defaults_const.get(key) {
-                            out.insert(key.to_string(), v.clone());
-                        }
-                    }
-                } else {
-                    for &key in keys {
-                        if let Some(v) = #defaults_const.get(key) {
-                            out.insert(key.to_string(), v.clone());
-                        }
-                    }
-                }
-            }
-        };
-
-        let get_many_ids_for_loop = if is_nullable {
-            quote! {
-                for record in records {
-                    if let Some(ref jsonb_val) = record.#jsonb_field_ident {
-                        if let Ok(value) = jsonb_val.get_value::<T>(key) {
-                            map.insert(record.#pk_field_ident, value);
-                        } else if let Ok(value) = #defaults_const.get_value::<T>(key) {
-                            map.insert(record.#pk_field_ident, value);
-                        }
-                    } else if let Ok(value) = #defaults_const.get_value::<T>(key) {
-                        map.insert(record.#pk_field_ident, value);
-                    }
-                }
-            }
-        } else {
-            quote! {
-                for record in records {
-                    if let Ok(value) = record.#jsonb_field_ident.get_value::<T>(key) {
-                        map.insert(record.#pk_field_ident, value);
-                    } else if let Ok(value) = #defaults_const.get_value::<T>(key) {
-                        map.insert(record.#pk_field_ident, value);
-                    }
-                }
-            }
+        let pk_where_sql = pk_columns
+            .iter()
+            .zip(pk_placeholders.iter())
+            .map(|(col, placeholder)| format!("{} = {}", col, placeholder))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let select_one_sql = format!(
+            "SELECT {} FROM {} WHERE {}",
+            jsonb_snake, table_name, pk_where_sql
+        );
+        let select_by_ids_sql = match pk_columns.first() {
+            Some(pk_col) => format!(
+                "SELECT {}, {} FROM {} WHERE {} = ANY($1)",
+                pk_col, jsonb_snake, table_name, pk_col
+            ),
+            None => String::new(),
         };
 
         quote! {
@@ -306,21 +164,28 @@ pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
                     Self { pool }
                 }
 
+                /// Reads just the JSONB column instead of the whole row.
+                /// A missing row and a NULL column both come back as None,
+                /// which callers resolve to the compiled-in defaults.
+                async fn fetch_jsonb(&self, #pk_params)
+                    -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    let client = self.pool.get().await
+                        .map_err(|e| format!("Failed to get database connection from pool: {}", e))?;
+
+                    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                        vec![#(#pk_args_for_set as &(dyn tokio_postgres::types::ToSql + Sync)),*];
+                    debug::log_query(#select_one_sql, params.len());
+
+                    let row = client.query_opt(#select_one_sql, &params[..]).await?;
+                    Ok(row.and_then(|row| row.get::<_, Option<serde_json::Value>>(0)))
+                }
+
                 pub async fn get_all(&self, #pk_params)
                     -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>
                 {
-                    match #query_builder::from_builder(
-                        self.pool.clone(),
-                        #where_builder_name::new()
-                            #pk_where_methods
-                    )
-                        .first()
-                        .await
-                    {
-                        #get_all_body
-                        Ok(None) => Ok(#defaults_const.clone()),
-                        Err(e) => Err(e),
-                    }
+                    Ok(self.fetch_jsonb(#pk_args_clone).await?
+                        .unwrap_or_else(|| #defaults_const.clone()))
                 }
 
                 pub async fn get_all_as<T>(&self, #pk_params)
@@ -335,17 +200,10 @@ pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
                 pub async fn get(&self, #pk_params, key: &str)
                     -> Result<String, Box<dyn std::error::Error + Send + Sync>>
                 {
-                    match #query_builder::from_builder(
-                        self.pool.clone(),
-                        #where_builder_name::new()
-                            #pk_where_methods
-                    )
-                        .first()
-                        .await
-                    {
-                        #get_body
-                        Ok(None) => #defaults_const.get_string(key),
-                        Err(e) => Err(e),
+                    match self.fetch_jsonb(#pk_args_clone).await? {
+                        Some(value) => value.get_string(key)
+                            .or_else(|_| #defaults_const.get_string(key)),
+                        None => #defaults_const.get_string(key),
                     }
                 }
 
@@ -354,17 +212,10 @@ pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
                 where
                     T: serde::de::DeserializeOwned,
                 {
-                    match #query_builder::from_builder(
-                        self.pool.clone(),
-                        #where_builder_name::new()
-                            #pk_where_methods
-                    )
-                        .first()
-                        .await
-                    {
-                        #get_as_body
-                        Ok(None) => #defaults_const.get_value(key),
-                        Err(e) => Err(e),
+                    match self.fetch_jsonb(#pk_args_clone).await? {
+                        Some(value) => value.get_value(key)
+                            .or_else(|_| #defaults_const.get_value(key)),
+                        None => #defaults_const.get_value(key),
                     }
                 }
 
@@ -382,17 +233,9 @@ pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
                 pub async fn has(&self, #pk_params, key: &str)
                     -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
                 {
-                    match #query_builder::from_builder(
-                        self.pool.clone(),
-                        #where_builder_name::new()
-                            #pk_where_methods
-                    )
-                        .first()
-                        .await
-                    {
-                        #has_body
-                        Ok(None) => Ok(#defaults_const.has_key(key)),
-                        Err(e) => Err(e),
+                    match self.fetch_jsonb(#pk_args_clone).await? {
+                        Some(value) => Ok(value.has_key(key) || #defaults_const.has_key(key)),
+                        None => Ok(#defaults_const.has_key(key)),
                     }
                 }
 
@@ -443,16 +286,16 @@ pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
                     &self, #pk_params, keys: &[&str]
                 ) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>
                 {
-                    let opt = #query_builder::from_builder(
-                        self.pool.clone(),
-                        #where_builder_name::new()
-                            #pk_where_methods
-                    )
-                        .first().await?;
+                    let stored = self.fetch_jsonb(#pk_args_clone).await?;
 
                     let mut out = HashMap::new();
-
-                    #get_many_for_loop
+                    for &key in keys {
+                        if let Some(value) = stored.as_ref().and_then(|stored| stored.get(key)) {
+                            out.insert(key.to_string(), value.clone());
+                        } else if let Some(value) = #defaults_const.get(key) {
+                            out.insert(key.to_string(), value.clone());
+                        }
+                    }
                     Ok(out)
                 }
 
@@ -480,15 +323,27 @@ pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
                         return Ok(HashMap::new());
                     }
 
-                    let records = #query_builder::from_builder(
-                        self.pool.clone(),
-                        #where_builder_name::new()
-                            .#pk_field_name_in(ids.to_vec())
-                    )
-                        .await?;
+                    let client = self.pool.get().await
+                        .map_err(|e| format!("Failed to get database connection from pool: {}", e))?;
+
+                    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                        vec![&ids as &(dyn tokio_postgres::types::ToSql + Sync)];
+                    debug::log_query(#select_by_ids_sql, params.len());
+
+                    let rows = client.query(#select_by_ids_sql, &params[..]).await?;
 
                     let mut map = HashMap::new();
-                    #get_many_ids_for_loop
+                    for row in rows {
+                        let id: #pk_field_type = row.get(0);
+                        let stored: Option<serde_json::Value> = row.get(1);
+                        let value = stored
+                            .as_ref()
+                            .and_then(|stored| stored.get_value::<T>(key).ok())
+                            .or_else(|| #defaults_const.get_value::<T>(key).ok());
+                        if let Some(value) = value {
+                            map.insert(id, value);
+                        }
+                    }
                     Ok(map)
                 }
             }
@@ -538,6 +393,17 @@ mod tests {
             modifiers: vec![],
             attributes: vec![],
         }
+    }
+
+    #[test]
+    fn reads_select_only_the_jsonb_column() {
+        let accessors =
+            generate_jsonb_sub_accessors(&model_with(vec![pk(), jsonb(), updated_at()]));
+        let code = accessors[0].to_string();
+
+        assert!(code.contains("\"SELECT data FROM settings WHERE id = $1\""));
+        assert!(code.contains("\"SELECT id, data FROM settings WHERE id = ANY($1)\""));
+        assert!(!code.contains("SettingsQuery"));
     }
 
     #[test]

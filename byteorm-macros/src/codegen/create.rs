@@ -1,5 +1,6 @@
 use crate::codegen::utils::{
-    generate_select_columns, generate_set_methods, generate_where_methods, is_builtin_type, to_snake_case,
+    generate_select_columns, generate_set_methods, generate_where_methods, is_builtin_type,
+    to_snake_case,
 };
 use crate::types::*;
 use proc_macro2::TokenStream;
