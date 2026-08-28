@@ -931,6 +931,128 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                 }
             }
 
+            pub struct UpsertCore {
+                table: &'static str,
+                select_columns: &'static str,
+                casts: &'static [(&'static str, &'static str)],
+                pk_columns: &'static [&'static str],
+                values: std::collections::HashMap<&'static str, SqlArg>,
+                arithmetic: std::collections::HashMap<&'static str, (&'static str, i64)>,
+            }
+
+            impl UpsertCore {
+                pub fn new(
+                    table: &'static str,
+                    select_columns: &'static str,
+                    casts: &'static [(&'static str, &'static str)],
+                    pk_columns: &'static [&'static str],
+                ) -> Self {
+                    Self {
+                        table,
+                        select_columns,
+                        casts,
+                        pk_columns,
+                        values: std::collections::HashMap::new(),
+                        arithmetic: std::collections::HashMap::new(),
+                    }
+                }
+
+                pub fn push_value(&mut self, column: &'static str, value: SqlArg) {
+                    self.values.insert(column, value);
+                }
+
+                pub fn push_arithmetic(&mut self, column: &'static str, op: &'static str, value: i64, seed: SqlArg) {
+                    self.arithmetic.insert(column, (op, value));
+                    self.values.insert(column, seed);
+                }
+
+                pub fn build(&mut self) -> Result<(String, Vec<SqlArg>), BoxError> {
+                    for pk in self.pk_columns {
+                        if !self.values.contains_key(pk) {
+                            return Err(format!("Missing primary key field: {}", pk).into());
+                        }
+                    }
+                    if self.values.is_empty() {
+                        return Err("No fields to upsert".into());
+                    }
+
+                    let mut columns: Vec<&'static str> = self.values.keys().copied().collect();
+                    columns.sort();
+
+                    let mut placeholders: Vec<String> = Vec::with_capacity(columns.len());
+                    let mut params: Vec<SqlArg> = Vec::with_capacity(columns.len());
+                    for column in &columns {
+                        let placeholder = params.len() + 1;
+                        match CreateCore::cast_for(self.casts, column) {
+                            Some(cast) => placeholders.push(format!("${}::TEXT::{}", placeholder, cast)),
+                            None => placeholders.push(format!("${}", placeholder)),
+                        }
+                        params.push(self.values.remove(column).expect("column was just listed"));
+                    }
+
+                    let update_columns: Vec<&'static str> = columns
+                        .iter()
+                        .copied()
+                        .filter(|column| !self.pk_columns.contains(column))
+                        .collect();
+
+                    let conflict_clause = self.pk_columns.join(", ");
+                    let sql = if update_columns.is_empty() && self.arithmetic.is_empty() {
+                        format!(
+                            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO NOTHING RETURNING {}",
+                            self.table,
+                            columns.join(", "),
+                            placeholders.join(", "),
+                            conflict_clause,
+                            self.select_columns
+                        )
+                    } else {
+                        let assignments: Vec<String> = update_columns
+                            .iter()
+                            .map(|column| match self.arithmetic.get(column) {
+                                Some((op, value)) => {
+                                    let symbol = match *op {
+                                        "inc" => "+",
+                                        "dec" => "-",
+                                        "mul" => "*",
+                                        "div" => "/",
+                                        _ => return format!("{} = EXCLUDED.{}", column, column),
+                                    };
+                                    let value = if *op == "dec" { value.abs() } else { *value };
+                                    format!(
+                                        "{} = COALESCE({}.{}, 0) {} {}",
+                                        column, self.table, column, symbol, value
+                                    )
+                                }
+                                None => format!("{} = EXCLUDED.{}", column, column),
+                            })
+                            .collect();
+
+                        format!(
+                            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {} RETURNING {}",
+                            self.table,
+                            columns.join(", "),
+                            placeholders.join(", "),
+                            conflict_clause,
+                            assignments.join(", "),
+                            self.select_columns
+                        )
+                    };
+
+                    Ok((sql, params))
+                }
+
+                pub async fn execute(mut self, pool: ConnectionPool)
+                    -> Result<tokio_postgres::Row, BoxError>
+                {
+                    let (sql, params) = self.build()?;
+                    debug::log_query(&sql, params.len());
+                    let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
+                    let refs = as_sql_refs(&params);
+                    Ok(client.query_one(&sql, &refs[..]).await?)
+                }
+            }
+
             pub struct QueryCore {
                 table: &'static str,
                 select_columns: &'static str,
