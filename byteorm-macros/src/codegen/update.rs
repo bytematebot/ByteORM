@@ -40,6 +40,7 @@ pub fn generate_update_builder(model: &Model) -> TokenStream {
             set_fragments: Vec<&'static str>,
             set_args: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
             inc_ops: Vec<(&'static str, &'static str, i64)>,
+            allow_all_rows: bool,
             fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<#model_name, Box<dyn std::error::Error + Send + Sync>>> + Send>>>,
         }
 
@@ -55,8 +56,16 @@ pub fn generate_update_builder(model: &Model) -> TokenStream {
                     set_fragments: vec![],
                     set_args: vec![],
                     inc_ops: vec![],
+                    allow_all_rows: false,
                     fut: None,
                 }
+            }
+
+            /// Allows the update to run without a WHERE clause, changing every
+            /// row in the table.
+            pub fn allow_all_rows(mut self) -> Self {
+                self.allow_all_rows = true;
+                self
             }
 
             #(#where_methods)*
@@ -72,6 +81,11 @@ pub fn generate_update_builder(model: &Model) -> TokenStream {
                 if me.fut.is_none() {
                     if me.set_fragments.is_empty() && me.inc_ops.is_empty() {
                         return std::task::Poll::Ready(Err("No fields to update".into()));
+                    }
+                    if me.where_predicates.is_empty() && !me.allow_all_rows {
+                        return std::task::Poll::Ready(Err(
+                            "UPDATE without WHERE clause is not allowed; call allow_all_rows() to update every row".into()
+                        ));
                     }
                     let enum_casts: std::collections::HashMap<&str, &str> = [
                         #(#enum_cast_entries),*
@@ -134,5 +148,31 @@ pub fn generate_update_builder(model: &Model) -> TokenStream {
                 me.fut.as_mut().unwrap().as_mut().poll(cx)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_update_builder;
+    use crate::types::{Field, Model, Modifier};
+
+    #[test]
+    fn update_without_where_is_refused_unless_opted_in() {
+        let model = Model {
+            name: "User".to_string(),
+            fields: vec![Field {
+                name: "id".to_string(),
+                type_name: "BigInt".to_string(),
+                modifiers: vec![Modifier::PrimaryKey],
+                attributes: vec![],
+            }],
+            computed_fields: vec![],
+            table_name: "user".to_string(),
+        };
+
+        let code = generate_update_builder(&model).to_string();
+
+        assert!(code.contains("allow_all_rows"));
+        assert!(code.contains("UPDATE without WHERE clause is not allowed"));
     }
 }
