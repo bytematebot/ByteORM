@@ -37,6 +37,18 @@ pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
         })
         .collect();
 
+    let has_updated_at = model
+        .fields
+        .iter()
+        .any(|f| to_snake_case(&f.name) == "updated_at");
+    let updated_at_column = if has_updated_at { ", updated_at" } else { "" };
+    let updated_at_value = if has_updated_at { ", NOW()" } else { "" };
+    let updated_at_assignment = if has_updated_at {
+        ", updated_at = NOW()"
+    } else {
+        ""
+    };
+
     let jsonb_fields: Vec<_> = model
         .fields
         .iter()
@@ -393,20 +405,23 @@ pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
                         .map_err(|e| format!("Failed to serialize value for key '{}': {}", key, e))?;
 
                     let sql = format!(
-                        "INSERT INTO {} ({}, {}, updated_at) VALUES ({}, jsonb_set('{{}}'::jsonb, string_to_array({}, '.')::text[], {}::jsonb, true), NOW()) \
-                         ON CONFLICT ({}) DO UPDATE SET {} = jsonb_set(COALESCE({}.{}, '{{}}'::jsonb), string_to_array({}, '.')::text[], {}::jsonb, true), updated_at = NOW()",
+                        "INSERT INTO {} ({}, {}{}) VALUES ({}, jsonb_set('{{}}'::jsonb, string_to_array({}, '.')::text[], {}::jsonb, true){}) \
+                         ON CONFLICT ({}) DO UPDATE SET {} = jsonb_set(COALESCE({}.{}, '{{}}'::jsonb), string_to_array({}, '.')::text[], {}::jsonb, true){}",
                         #table_name,
                         #insert_pk_part,
                         #jsonb_snake,
+                        #updated_at_column,
                         #insert_values_part,
                         #key_placeholder,
                         #value_placeholder,
+                        #updated_at_value,
                         #conflict_clause,
                         #jsonb_snake,
                         #table_name,
                         #jsonb_snake,
                         #key_placeholder,
                         #value_placeholder,
+                        #updated_at_assignment,
                     );
 
                     let client = self.pool.get().await
@@ -479,4 +494,63 @@ pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
             }
         }
     }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_jsonb_sub_accessors;
+    use crate::types::{Attribute, Field, Model, Modifier};
+
+    fn model_with(fields: Vec<Field>) -> Model {
+        Model {
+            name: "Settings".to_string(),
+            fields,
+            computed_fields: vec![],
+            table_name: "settings".to_string(),
+        }
+    }
+
+    fn pk() -> Field {
+        Field {
+            name: "id".to_string(),
+            type_name: "BigInt".to_string(),
+            modifiers: vec![Modifier::PrimaryKey],
+            attributes: vec![],
+        }
+    }
+
+    fn jsonb() -> Field {
+        Field {
+            name: "data".to_string(),
+            type_name: "JsonB".to_string(),
+            modifiers: vec![],
+            attributes: vec![Attribute {
+                name: "jsonb_default".to_string(),
+                args: Some("{}".to_string()),
+            }],
+        }
+    }
+
+    fn updated_at() -> Field {
+        Field {
+            name: "updatedAt".to_string(),
+            type_name: "TimestamptZ".to_string(),
+            modifiers: vec![],
+            attributes: vec![],
+        }
+    }
+
+    #[test]
+    fn set_touches_updated_at_only_when_the_column_exists() {
+        let with = generate_jsonb_sub_accessors(&model_with(vec![pk(), jsonb(), updated_at()]));
+        let code = with[0].to_string();
+        assert!(code.contains("\", updated_at\""));
+        assert!(code.contains("\", NOW()\""));
+        assert!(code.contains("\", updated_at = NOW()\""));
+
+        let without = generate_jsonb_sub_accessors(&model_with(vec![pk(), jsonb()]));
+        let code = without[0].to_string();
+        assert!(!code.contains("updated_at"));
+        assert!(!code.contains("NOW()"));
+    }
 }
