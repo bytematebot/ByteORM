@@ -538,29 +538,20 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
                     let create_builder = create(#create_builder::new(self.pool.clone()), record.clone());
                     let update_builder = update(#update_builder::new(self.pool.clone()), record);
 
-                    let #create_builder {
-                        where_predicates: create_where_predicates,
-                        set_values: mut create_set_values,
-                        ..
-                    } = create_builder;
+                    let (mut create_set_values, create_filters) =
+                        create_builder.into_core().into_parts();
+                    let (update_assignments, update_set_args, update_arithmetic, update_filters) =
+                        update_builder.into_core().into_parts();
 
-                    let #update_builder {
-                        where_predicates: update_where_predicates,
-                        set_fragments: update_set_fragments,
-                        set_args: update_set_args,
-                        inc_ops: update_inc_ops,
-                        ..
-                    } = update_builder;
-
-                    if !create_where_predicates.is_empty() {
+                    if !create_filters.is_empty() {
                         return Err("upsert_many does not support create where clauses".into());
                     }
 
-                    if !update_where_predicates.is_empty() {
+                    if !update_filters.is_empty() {
                         return Err("upsert_many does not support update where clauses".into());
                     }
 
-                    if !update_inc_ops.is_empty() {
+                    if !update_arithmetic.is_empty() {
                         return Err("upsert_many does not support increment operations".into());
                     }
 
@@ -580,7 +571,7 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
                         }
                     }
 
-                    if update_set_fragments.len() != update_set_args.len() {
+                    if update_assignments.len() != update_set_args.len() {
                         return Err("Invalid update builder state".into());
                     }
 
@@ -598,7 +589,8 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
                     let mut seen_update_columns = std::collections::HashSet::new();
                     let mut update_columns: Vec<&str> = Vec::new();
 
-                    for col in update_set_fragments {
+                    for assignment in update_assignments {
+                        let col = assignment.column;
                         if !seen_update_columns.insert(col) {
                             return Err(format!("Duplicate update field in upsert_many: {}", col).into());
                         }

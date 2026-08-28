@@ -141,6 +141,91 @@ pub fn pk_args(
     (pk_names, pk_types, pk_cols, pk_placeholders, pk_arg_refs)
 }
 
+/// Emits `where_*` methods that record predicates on a `__private::Filters`
+/// reached through `filters_expr` (e.g. `core.filters()`). The SQL itself is
+/// assembled by the shared runtime, not here.
+pub fn generate_filter_methods<'a>(
+    model: &'a Model,
+    filters_expr: &'a str,
+) -> impl Iterator<Item = TokenStream> + 'a {
+    let filters: TokenStream = filters_expr
+        .parse()
+        .expect("filters expression must be valid Rust");
+
+    model.fields.iter().flat_map(move |field| {
+        let snake = to_snake_case(&field.name);
+        let method_name = format_ident!("where_{}", snake);
+        let method_in = format_ident!("where_{}_in", snake);
+        let is_nullable = field
+            .modifiers
+            .iter()
+            .any(|m| matches!(m, Modifier::Nullable));
+        let field_type = rust_type_from_schema(&field.type_name, is_nullable);
+        let field_col = snake.clone();
+        let filters = filters.clone();
+
+        let mut methods = vec![
+            quote! {
+                pub fn #method_name(mut self, value: #field_type) -> Self {
+                    self.#filters.push(#field_col, WhereOp::Eq, Box::new(value));
+                    self
+                }
+            },
+            quote! {
+                pub fn #method_in(mut self, values: Vec<#field_type>) -> Self {
+                    let values: Vec<__private::SqlArg> = values
+                        .into_iter()
+                        .map(|value| Box::new(value) as __private::SqlArg)
+                        .collect();
+                    self.#filters.push_in(#field_col, values);
+                    self
+                }
+            },
+        ];
+
+        if is_nullable {
+            let method_is_null = format_ident!("where_{}_is_null", snake);
+            let method_is_not_null = format_ident!("where_{}_is_not_null", snake);
+            let filters_null = filters.clone();
+            let filters_not_null = filters.clone();
+            methods.push(quote! {
+                pub fn #method_is_null(mut self) -> Self {
+                    self.#filters_null.push_bare(#field_col, WhereOp::IsNull);
+                    self
+                }
+            });
+            methods.push(quote! {
+                pub fn #method_is_not_null(mut self) -> Self {
+                    self.#filters_not_null.push_bare(#field_col, WhereOp::IsNotNull);
+                    self
+                }
+            });
+        }
+
+        if field.type_name == "TimestamptZ" {
+            let comparisons = [
+                (format_ident!("where_{}_gt", snake), format_ident!("Gt")),
+                (format_ident!("where_{}_lt", snake), format_ident!("Lt")),
+                (format_ident!("where_{}_gte", snake), format_ident!("Gte")),
+                (format_ident!("where_{}_lte", snake), format_ident!("Lte")),
+            ];
+            methods.extend(comparisons.into_iter().map(|(method, op)| {
+                let field_type = field_type.clone();
+                let field_col = field_col.clone();
+                let filters = filters.clone();
+                quote! {
+                    pub fn #method(mut self, value: #field_type) -> Self {
+                        self.#filters.push(#field_col, WhereOp::#op, Box::new(value));
+                        self
+                    }
+                }
+            }));
+        }
+
+        methods.into_iter()
+    })
+}
+
 fn generate_where_methods_inner<'a>(
     model: &'a Model,
     target_args: &'a str,
@@ -297,6 +382,142 @@ pub fn generate_set_methods<'a>(
             }
         }
     })
+}
+
+/// Emits `set_*` methods for the create builder. Enum casts are applied by
+/// `CreateCore` from the model's static cast table, so the value only needs
+/// to arrive as text.
+pub fn generate_create_value_methods<'a>(
+    model: &'a Model,
+    target: &'a str,
+) -> impl Iterator<Item = TokenStream> + 'a {
+    let core: TokenStream = target.parse().expect("target must be valid Rust");
+
+    model.fields.iter().map(move |field| {
+        let snake = to_snake_case(&field.name);
+        let method_name = format_ident!("set_{}", snake);
+        let is_nullable = field
+            .modifiers
+            .iter()
+            .any(|m| matches!(m, Modifier::Nullable));
+        let field_type = rust_type_from_schema(&field.type_name, is_nullable);
+        let field_col = snake.clone();
+        let core = core.clone();
+
+        if !is_builtin_type(&field.type_name) {
+            quote! {
+                pub fn #method_name(mut self, value: #field_type) -> Self {
+                    self.#core.push_value(#field_col, Box::new(value.to_string()));
+                    self
+                }
+            }
+        } else if matches!(field.type_name.as_str(), "String" | "Text") {
+            quote! {
+                pub fn #method_name(mut self, value: impl Into<#field_type>) -> Self {
+                    self.#core.push_value(#field_col, Box::new(value.into()));
+                    self
+                }
+            }
+        } else {
+            quote! {
+                pub fn #method_name(mut self, value: #field_type) -> Self {
+                    self.#core.push_value(#field_col, Box::new(value));
+                    self
+                }
+            }
+        }
+    })
+}
+
+/// Emits `set_*` methods for the update builder, carrying the enum cast that
+/// the assignment needs.
+pub fn generate_update_set_methods<'a>(
+    model: &'a Model,
+    target: &'a str,
+) -> impl Iterator<Item = TokenStream> + 'a {
+    let core: TokenStream = target.parse().expect("target must be valid Rust");
+
+    model.fields.iter().map(move |field| {
+        let snake = to_snake_case(&field.name);
+        let method_name = format_ident!("set_{}", snake);
+        let is_nullable = field
+            .modifiers
+            .iter()
+            .any(|m| matches!(m, Modifier::Nullable));
+        let field_type = rust_type_from_schema(&field.type_name, is_nullable);
+        let field_col = snake.clone();
+        let core = core.clone();
+
+        if !is_builtin_type(&field.type_name) {
+            let cast = field.type_name.to_lowercase();
+            quote! {
+                pub fn #method_name(mut self, value: #field_type) -> Self {
+                    self.#core.push_set(#field_col, Some(#cast), Box::new(value.to_string()));
+                    self
+                }
+            }
+        } else if matches!(field.type_name.as_str(), "String" | "Text") {
+            quote! {
+                pub fn #method_name(mut self, value: impl Into<#field_type>) -> Self {
+                    self.#core.push_set(#field_col, None, Box::new(value.into()));
+                    self
+                }
+            }
+        } else {
+            quote! {
+                pub fn #method_name(mut self, value: #field_type) -> Self {
+                    self.#core.push_set(#field_col, None, Box::new(value));
+                    self
+                }
+            }
+        }
+    })
+}
+
+/// Emits `inc_*` / `dec_*` / `mul_*` / `div_*` methods for the update builder.
+pub fn generate_arithmetic_methods<'a>(
+    model: &'a Model,
+    target: &'a str,
+) -> impl Iterator<Item = TokenStream> + 'a {
+    let core: TokenStream = target.parse().expect("target must be valid Rust");
+
+    model
+        .fields
+        .iter()
+        .filter(|f| is_numeric_type(&f.type_name))
+        .map(move |field| {
+            let field_col = to_snake_case(&field.name);
+            let inc_method = format_ident!("inc_{}", field_col);
+            let dec_method = format_ident!("dec_{}", field_col);
+            let mul_method = format_ident!("mul_{}", field_col);
+            let div_method = format_ident!("div_{}", field_col);
+            let (c1, c2, c3, c4) = (core.clone(), core.clone(), core.clone(), core.clone());
+            let (f1, f2, f3, f4) = (
+                field_col.clone(),
+                field_col.clone(),
+                field_col.clone(),
+                field_col.clone(),
+            );
+
+            quote! {
+                pub fn #inc_method(mut self, amount: i64) -> Self {
+                    self.#c1.push_arithmetic(#f1, "inc", amount);
+                    self
+                }
+                pub fn #dec_method(mut self, amount: i64) -> Self {
+                    self.#c2.push_arithmetic(#f2, "dec", amount);
+                    self
+                }
+                pub fn #mul_method(mut self, factor: i64) -> Self {
+                    self.#c3.push_arithmetic(#f3, "mul", factor);
+                    self
+                }
+                pub fn #div_method(mut self, divisor: i64) -> Self {
+                    self.#c4.push_arithmetic(#f4, "div", divisor);
+                    self
+                }
+            }
+        })
 }
 
 pub fn generate_inc_methods<'a>(

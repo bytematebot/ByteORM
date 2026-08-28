@@ -1,6 +1,6 @@
 use crate::codegen::utils::{
-    generate_select_columns, generate_set_methods, generate_where_methods, is_builtin_type,
-    to_snake_case,
+    generate_create_value_methods, generate_filter_methods, generate_select_columns,
+    is_builtin_type, to_snake_case,
 };
 use crate::types::*;
 use proc_macro2::TokenStream;
@@ -25,10 +25,8 @@ pub fn generate_create_builder(model: &Model) -> TokenStream {
         .map(|field| to_snake_case(&field.name))
         .collect();
 
-    let where_methods = generate_where_methods(model, "where_args", "where_predicates");
-
-    let set_methods = generate_set_methods(model, true, "set_values", None, None);
-
+    let where_methods = generate_filter_methods(model, "core.filters()");
+    let set_methods = generate_create_value_methods(model, "core");
     let select_columns = generate_select_columns(model);
 
     let enum_cast_entries: Vec<TokenStream> = model
@@ -42,28 +40,39 @@ pub fn generate_create_builder(model: &Model) -> TokenStream {
         })
         .collect();
 
-    quote! {
-        pub struct #create_builder_name {
-            pool: ConnectionPool,
-            table: String,
-            where_predicates: Vec<WherePredicate>,
-            where_args: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
-            set_values: std::collections::HashMap<&'static str, Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
-            fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<#model_name, Box<dyn std::error::Error + Send + Sync>>> + Send>>>,
-        }
+    let required_const = format_ident!("{}_REQUIRED_COLUMNS", model.name.to_uppercase());
+    let casts_const = format_ident!("{}_ENUM_CASTS", model.name.to_uppercase());
 
-        unsafe impl Send for #create_builder_name {}
+    quote! {
+        #[doc(hidden)]
+        pub static #required_const: &[&str] = &[#(#required_fields),*];
+
+        #[doc(hidden)]
+        pub static #casts_const: &[(&str, &str)] = &[#(#enum_cast_entries),*];
+
+        pub struct #create_builder_name {
+            core: __private::CreateCore,
+            pool: ConnectionPool,
+            fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<tokio_postgres::Row, Box<dyn std::error::Error + Send + Sync>>> + Send>>>,
+        }
 
         impl #create_builder_name {
             pub fn new(pool: ConnectionPool) -> Self {
                 Self {
+                    core: __private::CreateCore::new(
+                        #table_name,
+                        #select_columns,
+                        #required_const,
+                        #casts_const,
+                    ),
                     pool,
-                    table: #table_name.to_string(),
-                    where_predicates: vec![],
-                    where_args: vec![],
-                    set_values: std::collections::HashMap::new(),
                     fut: None,
                 }
+            }
+
+            /// Hands the collected values to `upsert_many`.
+            pub fn into_core(self) -> __private::CreateCore {
+                self.core
             }
 
             #(#where_methods)*
@@ -76,82 +85,25 @@ pub fn generate_create_builder(model: &Model) -> TokenStream {
                 let me = &mut *self;
 
                 if me.fut.is_none() {
-                    let required_fields: Vec<&str> = vec![#(#required_fields),*];
-
-                    for req in &required_fields {
-                        if !me.set_values.contains_key(req) {
-                            return std::task::Poll::Ready(Err(format!("Missing required field: {}", req).into()));
-                        }
-                    }
-
-                    if me.set_values.is_empty() && !required_fields.is_empty() {
-                        return std::task::Poll::Ready(Err("No fields to create".into()));
-                    }
-
-                    let pool = me.pool.clone();
-                    let table = me.table.clone();
-                    let where_predicates = std::mem::take(&mut me.where_predicates);
-                    let where_args = std::mem::take(&mut me.where_args);
-                    let set_values = std::mem::take(&mut me.set_values);
-
-                    let fut = async move {
-                        let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
-
-                        if !where_predicates.is_empty() {
-                            let mut sql = format!("SELECT COUNT(*) FROM {}", table);
-                            let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![];
-                            let (conds, _) = render_where_predicates(&where_predicates, 1);
-                            sql.push_str(" WHERE ");
-                            sql.push_str(&conds.join(" AND "));
-                            for arg in &where_args {
-                                params.push(arg.as_ref());
-                            }
-                            let row = client.query_one(&sql, &params[..]).await?;
-                            let count: i64 = row.get(0);
-                            if count > 0 {
-                                return Err("Record already exists".into());
-                            }
-                        }
-
-                        let enum_casts: std::collections::HashMap<&str, &str> = [
-                            #(#enum_cast_entries),*
-                        ].into_iter().collect();
-
-                        let mut columns: Vec<&str> = set_values.keys().copied().collect();
-                        columns.sort();
-
-                        let columns_str = columns.join(", ");
-                        let placeholders: Vec<String> = columns.iter().enumerate()
-                            .map(|(i, col)| {
-                                let idx = i + 1;
-                                if let Some(enum_type) = enum_casts.get(col) {
-                                    format!("${}::TEXT::{}", idx, enum_type)
-                                } else {
-                                    format!("${}", idx)
-                                }
-                            })
-                            .collect();
-                        let placeholders_str = placeholders.join(", ");
-
-                        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![];
-                        for col in &columns {
-                            params.push(set_values.get(col).unwrap().as_ref());
-                        }
-
-                        let sql = format!(
-                            "INSERT INTO {} ({}) VALUES ({}) RETURNING {}",
-                            table, columns_str, placeholders_str, #select_columns
-                        );
-
-                        debug::log_query(&sql, params.len());
-
-                        let row = client.query_one(&sql, &params[..]).await?;
-                        Ok(#model_name::from_row(&row))
-                    };
-                    me.fut = Some(Box::pin(fut));
+                    let core = std::mem::replace(
+                        &mut me.core,
+                        __private::CreateCore::new(
+                            #table_name,
+                            #select_columns,
+                            #required_const,
+                            #casts_const,
+                        ),
+                    );
+                    me.fut = Some(Box::pin(core.execute(me.pool.clone())));
                 }
 
-                me.fut.as_mut().unwrap().as_mut().poll(cx)
+                match me.fut.as_mut().unwrap().as_mut().poll(cx) {
+                    std::task::Poll::Ready(Ok(row)) => {
+                        std::task::Poll::Ready(Ok(#model_name::from_row(&row)))
+                    }
+                    std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                }
             }
         }
     }
