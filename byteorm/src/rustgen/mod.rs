@@ -284,6 +284,88 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                 .collect()
         }
 
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum WhereOp {
+            Eq,
+            Gt,
+            Lt,
+            Gte,
+            Lte,
+            In,
+            IsNull,
+            IsNotNull,
+        }
+
+        impl WhereOp {
+            pub fn symbol(self) -> &'static str {
+                match self {
+                    WhereOp::Eq => "=",
+                    WhereOp::Gt => ">",
+                    WhereOp::Lt => "<",
+                    WhereOp::Gte => ">=",
+                    WhereOp::Lte => "<=",
+                    WhereOp::In => "IN",
+                    WhereOp::IsNull => "IS NULL",
+                    WhereOp::IsNotNull => "IS NOT NULL",
+                }
+            }
+        }
+
+        /// A single WHERE condition. `args` indexes the builder's argument
+        /// vector, so SQL text and placeholder numbers are produced only by
+        /// `render_where_predicates`, never by the builder methods.
+        #[derive(Debug, Clone)]
+        pub struct WherePredicate {
+            pub column: &'static str,
+            pub op: WhereOp,
+            pub args: std::ops::Range<usize>,
+        }
+
+        impl WherePredicate {
+            pub fn new(column: &'static str, op: WhereOp, args: std::ops::Range<usize>) -> Self {
+                Self { column, op, args }
+            }
+        }
+
+        /// Renders predicates into SQL, numbering placeholders from
+        /// `next_param`. Returns the clauses and the next free placeholder
+        /// number, so callers that emit parameters before the WHERE clause
+        /// (UPDATE ... SET) can pass their own offset in.
+        pub fn render_where_predicates(
+            predicates: &[WherePredicate],
+            next_param: usize,
+        ) -> (Vec<String>, usize) {
+            let mut next_param = next_param;
+            let mut clauses = Vec::with_capacity(predicates.len());
+            for predicate in predicates {
+                let count = predicate.args.len();
+                let clause = match predicate.op {
+                    WhereOp::IsNull | WhereOp::IsNotNull => {
+                        format!("{} {}", predicate.column, predicate.op.symbol())
+                    }
+                    WhereOp::In => {
+                        if count == 0 {
+                            // `IN ()` is not valid SQL; an empty set matches nothing.
+                            "1 = 0".to_string()
+                        } else {
+                            let placeholders: Vec<String> = (next_param..next_param + count)
+                                .map(|i| format!("${}", i))
+                                .collect();
+                            next_param += count;
+                            format!("{} IN ({})", predicate.column, placeholders.join(", "))
+                        }
+                    }
+                    op => {
+                        let clause = format!("{} {} ${}", predicate.column, op.symbol(), next_param);
+                        next_param += count;
+                        clause
+                    }
+                };
+                clauses.push(clause);
+            }
+            (clauses, next_param)
+        }
+
         pub mod debug {
             use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -699,7 +781,7 @@ fn generate_derive_model(
         use once_cell::sync::Lazy;
         use std::pin::Pin;
         use std::task::{Context, Poll};
-        use crate::{ByteOrmError, ConnectionPool, FromRow, PooledClient, debug, expect_keys, JsonbExt};
+        use crate::{ByteOrmError, ConnectionPool, FromRow, PooledClient, debug, expect_keys, render_where_predicates, JsonbExt, WhereOp, WherePredicate};
         use crate::enums::*;
         use byteorm_macros::ByteOrm;
 

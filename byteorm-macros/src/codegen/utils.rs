@@ -144,8 +144,7 @@ pub fn pk_args(
 fn generate_where_methods_inner<'a>(
     model: &'a Model,
     target_args: &'a str,
-    target_fragments: &'a str,
-    append_equals: bool,
+    target_predicates: &'a str,
 ) -> impl Iterator<Item = TokenStream> + 'a {
     model.fields.iter().flat_map(move |field| {
         let method_name = format_ident!("where_{}", to_snake_case(&field.name));
@@ -154,29 +153,23 @@ fn generate_where_methods_inner<'a>(
         let field_type = rust_type_from_schema(&field.type_name, is_nullable);
         let field_col = to_snake_case(&field.name);
         let args_ident = format_ident!("{}", target_args);
-        let fragments_ident = format_ident!("{}", target_fragments);
-
-        let fragment_expr = if append_equals {
-            quote! { format!("{} =", #field_col) }
-        } else {
-            quote! { #field_col.to_string() }
-        };
+        let predicates_ident = format_ident!("{}", target_predicates);
 
         let base_method = quote! {
             pub fn #method_name(mut self, value: #field_type) -> Self {
+                let start = self.#args_ident.len();
                 self.#args_ident.push(Box::new(value) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>);
-                self.#fragments_ident.push((#fragment_expr, self.#args_ident.len()));
+                self.#predicates_ident.push(WherePredicate::new(#field_col, WhereOp::Eq, start..self.#args_ident.len()));
                 self
             }
         };
         let in_method = quote! {
             pub fn #method_in(mut self, values: Vec<#field_type>) -> Self {
-                if values.is_empty() { return self; }
-                let start_idx = self.#args_ident.len() + 1;
-                let placeholders: Vec<String> = (start_idx..start_idx + values.len()).map(|i| format!("${}", i)).collect();
-                let in_clause = format!("{} IN ({})", #field_col, placeholders.join(", "));
-                for value in values { self.#args_ident.push(Box::new(value) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>); }
-                self.#fragments_ident.push((in_clause, 0));
+                let start = self.#args_ident.len();
+                for value in values {
+                    self.#args_ident.push(Box::new(value) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>);
+                }
+                self.#predicates_ident.push(WherePredicate::new(#field_col, WhereOp::In, start..self.#args_ident.len()));
                 self
             }
         };
@@ -184,8 +177,20 @@ fn generate_where_methods_inner<'a>(
             let method_is_null = format_ident!("where_{}_is_null", to_snake_case(&field.name));
             let method_is_not_null = format_ident!("where_{}_is_not_null", to_snake_case(&field.name));
             vec![
-                quote! { pub fn #method_is_null(mut self) -> Self { self.#fragments_ident.push((format!("{} IS NULL", #field_col), 0)); self } },
-                quote! { pub fn #method_is_not_null(mut self) -> Self { self.#fragments_ident.push((format!("{} IS NOT NULL", #field_col), 0)); self } }
+                quote! {
+                    pub fn #method_is_null(mut self) -> Self {
+                        let at = self.#args_ident.len();
+                        self.#predicates_ident.push(WherePredicate::new(#field_col, WhereOp::IsNull, at..at));
+                        self
+                    }
+                },
+                quote! {
+                    pub fn #method_is_not_null(mut self) -> Self {
+                        let at = self.#args_ident.len();
+                        self.#predicates_ident.push(WherePredicate::new(#field_col, WhereOp::IsNotNull, at..at));
+                        self
+                    }
+                }
             ]
         } else { vec![] };
 
@@ -193,16 +198,23 @@ fn generate_where_methods_inner<'a>(
         methods.extend(null_methods);
 
         if field.type_name == "TimestamptZ" {
-            let method_gt = format_ident!("where_{}_gt", to_snake_case(&field.name));
-            let method_lt = format_ident!("where_{}_lt", to_snake_case(&field.name));
-            let method_gte = format_ident!("where_{}_gte", to_snake_case(&field.name));
-            let method_lte = format_ident!("where_{}_lte", to_snake_case(&field.name));
-            methods.extend(vec![
-                quote! { pub fn #method_gt(mut self, value: #field_type) -> Self { self.#args_ident.push(Box::new(value) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>); self.#fragments_ident.push((format!("{} >", #field_col), self.#args_ident.len())); self } },
-                quote! { pub fn #method_lt(mut self, value: #field_type) -> Self { self.#args_ident.push(Box::new(value) as Box<dyn tokio_postgres::types::ToSql + Send + Sync>); self.#fragments_ident.push((format!("{} <", #field_col), self.#args_ident.len())); self } },
-                quote! { pub fn #method_gte(mut self, value: #field_type) -> Self { self.#args_ident.push(Box::new(value) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>); self.#fragments_ident.push((format!("{} >=", #field_col), self.#args_ident.len())); self } },
-                quote! { pub fn #method_lte(mut self, value: #field_type) -> Self { self.#args_ident.push(Box::new(value) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>); self.#fragments_ident.push((format!("{} <=", #field_col), self.#args_ident.len())); self } },
-            ]);
+            let comparisons = [
+                (format_ident!("where_{}_gt", to_snake_case(&field.name)), format_ident!("Gt")),
+                (format_ident!("where_{}_lt", to_snake_case(&field.name)), format_ident!("Lt")),
+                (format_ident!("where_{}_gte", to_snake_case(&field.name)), format_ident!("Gte")),
+                (format_ident!("where_{}_lte", to_snake_case(&field.name)), format_ident!("Lte")),
+            ];
+            methods.extend(comparisons.into_iter().map(|(method, op)| {
+                let field_type = field_type.clone();
+                quote! {
+                    pub fn #method(mut self, value: #field_type) -> Self {
+                        let start = self.#args_ident.len();
+                        self.#args_ident.push(Box::new(value) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>);
+                        self.#predicates_ident.push(WherePredicate::new(#field_col, WhereOp::#op, start..self.#args_ident.len()));
+                        self
+                    }
+                }
+            }));
         }
         methods.into_iter()
     })
@@ -211,17 +223,9 @@ fn generate_where_methods_inner<'a>(
 pub fn generate_where_methods<'a>(
     model: &'a Model,
     target_args: &'a str,
-    target_fragments: &'a str,
+    target_predicates: &'a str,
 ) -> impl Iterator<Item = TokenStream> + 'a {
-    generate_where_methods_inner(model, target_args, target_fragments, false)
-}
-
-pub fn generate_where_methods_with_equals<'a>(
-    model: &'a Model,
-    target_args: &'a str,
-    target_fragments: &'a str,
-) -> impl Iterator<Item = TokenStream> + 'a {
-    generate_where_methods_inner(model, target_args, target_fragments, true)
+    generate_where_methods_inner(model, target_args, target_predicates)
 }
 
 pub fn generate_set_methods<'a>(

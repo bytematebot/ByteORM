@@ -8,13 +8,13 @@ pub fn generate_delete_builder(model: &Model) -> TokenStream {
     let delete_builder_name = format_ident!("{}Delete", model.name);
     let table_name = model.name.to_lowercase();
 
-    let where_methods = generate_where_methods(model, "where_args", "where_fragments");
+    let where_methods = generate_where_methods(model, "where_args", "where_predicates");
 
     quote! {
         pub struct #delete_builder_name {
             pool: ConnectionPool,
             table: String,
-            where_fragments: Vec<(String, usize)>,
+            where_predicates: Vec<WherePredicate>,
             where_args: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
             fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, Box<dyn std::error::Error + Send + Sync>>> + Send>>>,
         }
@@ -26,7 +26,7 @@ pub fn generate_delete_builder(model: &Model) -> TokenStream {
                 Self {
                     pool,
                     table: #table_name.to_string(),
-                    where_fragments: vec![],
+                    where_predicates: vec![],
                     where_args: vec![],
                     fut: None,
                 }
@@ -41,17 +41,12 @@ pub fn generate_delete_builder(model: &Model) -> TokenStream {
                 let me = &mut *self;
 
                 if me.fut.is_none() {
-                    if me.where_fragments.is_empty() {
+                    if me.where_predicates.is_empty() {
                         return std::task::Poll::Ready(Err("DELETE without WHERE clause is not allowed".into()));
                     }
 
                     let mut sql = format!("DELETE FROM {}", me.table);
-                    let conds: Vec<String> = me.where_fragments.iter()
-                        .enumerate()
-                        .map(|(i, (col, idx))| {
-                            format!("{} = ${}", col, i + 1)
-                        })
-                        .collect();
+                    let (conds, _) = render_where_predicates(&me.where_predicates, 1);
                     sql.push_str(" WHERE ");
                     sql.push_str(&conds.join(" AND "));
 

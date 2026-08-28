@@ -25,7 +25,7 @@ pub fn generate_create_builder(model: &Model) -> TokenStream {
         .map(|field| to_snake_case(&field.name))
         .collect();
 
-    let where_methods = generate_where_methods(model, "where_args", "where_fragments");
+    let where_methods = generate_where_methods(model, "where_args", "where_predicates");
 
     let set_methods = generate_set_methods(model, true, "set_values", None, None);
 
@@ -46,7 +46,7 @@ pub fn generate_create_builder(model: &Model) -> TokenStream {
         pub struct #create_builder_name {
             pool: ConnectionPool,
             table: String,
-            where_fragments: Vec<(String, usize)>,
+            where_predicates: Vec<WherePredicate>,
             where_args: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
             set_values: std::collections::HashMap<&'static str, Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
             fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<#model_name, Box<dyn std::error::Error + Send + Sync>>> + Send>>>,
@@ -59,7 +59,7 @@ pub fn generate_create_builder(model: &Model) -> TokenStream {
                 Self {
                     pool,
                     table: #table_name.to_string(),
-                    where_fragments: vec![],
+                    where_predicates: vec![],
                     where_args: vec![],
                     set_values: std::collections::HashMap::new(),
                     fut: None,
@@ -90,20 +90,17 @@ pub fn generate_create_builder(model: &Model) -> TokenStream {
 
                     let pool = me.pool.clone();
                     let table = me.table.clone();
-                    let where_fragments = std::mem::take(&mut me.where_fragments);
+                    let where_predicates = std::mem::take(&mut me.where_predicates);
                     let where_args = std::mem::take(&mut me.where_args);
                     let set_values = std::mem::take(&mut me.set_values);
 
                     let fut = async move {
                         let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
 
-                        if !where_fragments.is_empty() {
+                        if !where_predicates.is_empty() {
                             let mut sql = format!("SELECT COUNT(*) FROM {}", table);
                             let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![];
-                            let conds: Vec<String> = where_fragments.iter()
-                                .enumerate()
-                                .map(|(i, (col, idx))| format!("{} = ${}", col, i + 1))
-                                .collect();
+                            let (conds, _) = render_where_predicates(&where_predicates, 1);
                             sql.push_str(" WHERE ");
                             sql.push_str(&conds.join(" AND "));
                             for arg in &where_args {

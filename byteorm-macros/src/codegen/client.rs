@@ -551,24 +551,24 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
                     let update_builder = update(#update_builder::new(self.pool.clone()), record);
 
                     let #create_builder {
-                        where_fragments: create_where_fragments,
+                        where_predicates: create_where_predicates,
                         set_values: mut create_set_values,
                         ..
                     } = create_builder;
 
                     let #update_builder {
-                        where_fragments: update_where_fragments,
+                        where_predicates: update_where_predicates,
                         set_fragments: update_set_fragments,
                         set_args: update_set_args,
                         inc_ops: update_inc_ops,
                         ..
                     } = update_builder;
 
-                    if !create_where_fragments.is_empty() {
+                    if !create_where_predicates.is_empty() {
                         return Err("upsert_many does not support create where clauses".into());
                     }
 
-                    if !update_where_fragments.is_empty() {
+                    if !update_where_predicates.is_empty() {
                         return Err("upsert_many does not support update where clauses".into());
                     }
 

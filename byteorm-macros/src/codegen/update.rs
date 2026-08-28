@@ -11,7 +11,7 @@ pub fn generate_update_builder(model: &Model) -> TokenStream {
     let update_builder_name = format_ident!("{}Update", model.name);
     let table_name = model.name.to_lowercase();
 
-    let where_methods = generate_where_methods(model, "where_args", "where_fragments");
+    let where_methods = generate_where_methods(model, "where_args", "where_predicates");
 
     let set_methods =
         generate_set_methods(model, false, "", Some("set_args"), Some("set_fragments"));
@@ -35,7 +35,7 @@ pub fn generate_update_builder(model: &Model) -> TokenStream {
         pub struct #update_builder_name {
             pool: ConnectionPool,
             table: String,
-            where_fragments: Vec<(String, usize)>,
+            where_predicates: Vec<WherePredicate>,
             where_args: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
             set_fragments: Vec<&'static str>,
             set_args: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
@@ -50,7 +50,7 @@ pub fn generate_update_builder(model: &Model) -> TokenStream {
                 Self {
                     pool,
                     table: #table_name.to_string(),
-                    where_fragments: vec![],
+                    where_predicates: vec![],
                     where_args: vec![],
                     set_fragments: vec![],
                     set_args: vec![],
@@ -109,12 +109,8 @@ pub fn generate_update_builder(model: &Model) -> TokenStream {
                         all_params.push(Box::new(*val));
                     }
 
-                    if !me.where_fragments.is_empty() {
-                        let where_clauses: Vec<String> = me.where_fragments.iter()
-                            .enumerate()
-                            .map(|(i, (col, _))| format!(
-                                "{} = ${}", col, param_idx + i))
-                            .collect();
+                    if !me.where_predicates.is_empty() {
+                        let (where_clauses, _) = render_where_predicates(&me.where_predicates, param_idx);
                         sql.push_str(" WHERE ");
                         sql.push_str(&where_clauses.join(" AND "));
                         for arg in std::mem::take(&mut me.where_args) {

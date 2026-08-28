@@ -5,9 +5,9 @@ use quote::{format_ident, quote};
 pub fn generate_where_methods<'a>(
     model: &'a Model,
     target_args: &'a str,
-    target_fragments: &'a str,
+    target_predicates: &'a str,
 ) -> impl Iterator<Item = TokenStream> + 'a {
-    crate::codegen::utils::generate_where_methods_with_equals(model, target_args, target_fragments)
+    crate::codegen::utils::generate_where_methods(model, target_args, target_predicates)
 }
 
 pub use crate::codegen::utils::{
