@@ -164,30 +164,7 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
 
     let find_unique = generate_find_unique(&model_name, model);
     let find_or_create = generate_find_or_create(&model_name, model, &table_name);
-    let required_fields: Vec<String> = model
-        .fields
-        .iter()
-        .filter(|field| {
-            !field.attributes.iter().any(|a| a.name == "default")
-                && !field
-                    .modifiers
-                    .iter()
-                    .any(|m| matches!(m, Modifier::Nullable))
-                && field.type_name != "Serial"
-        })
-        .map(|field| to_snake_case(&field.name))
-        .collect();
-
-    let enum_cast_entries: Vec<TokenStream> = model
-        .fields
-        .iter()
-        .filter(|field| !is_builtin_type(&field.type_name))
-        .map(|field| {
-            let col_name = to_snake_case(&field.name);
-            let type_name = field.type_name.to_lowercase();
-            quote! { (#col_name, #type_name) }
-        })
-        .collect();
+    let casts_const = format_ident!("{}_ENUM_CASTS", model.name.to_uppercase());
 
     let conflict_selector_fields = model.fields.iter().map(|field| {
         let field_name = format_ident!("{}", to_snake_case(&field.name));
@@ -443,55 +420,7 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
             pub async fn create_many(&self, records: Vec<std::collections::HashMap<&'static str, Box<dyn tokio_postgres::types::ToSql + Sync + Send>>>)
                 -> Result<u64, Box<dyn std::error::Error + Send + Sync>>
             {
-                if records.is_empty() {
-                    return Ok(0);
-                }
-
-                let client = self.pool.get().await.map_err(|_| "Failed to get connection from pool")?;
-
-                let first = &records[0];
-                let mut columns: Vec<&'static str> = first.keys().copied().collect();
-                columns.sort();
-                if columns.is_empty() {
-                    return Err("Cannot create records without any columns".into());
-                }
-                let columns_str = columns.join(", ");
-
-                let mut all_values: Vec<String> = Vec::with_capacity(records.len());
-                let mut all_params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
-                let mut param_idx = 1;
-
-                for mut record in records {
-                    let mut placeholders: Vec<String> = Vec::with_capacity(columns.len());
-                    for col in &columns {
-                        let val = record.remove(*col).ok_or_else(|| {
-                            format!("Record is missing column `{}` present in the first record", col)
-                        })?;
-                        placeholders.push(format!("${}", param_idx));
-                        param_idx += 1;
-                        all_params.push(val);
-                    }
-                    if let Some(extra) = record.keys().next() {
-                        return Err(format!(
-                            "Record has column `{}` that is not present in the first record",
-                            extra
-                        )
-                        .into());
-                    }
-                    all_values.push(format!("({})", placeholders.join(", ")));
-                }
-
-                let sql = format!(
-                    "INSERT INTO {} ({}) VALUES {}",
-                    #table_name, columns_str, all_values.join(", ")
-                );
-
-                debug::log_query(&sql, all_params.len());
-
-                let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                    all_params.iter().map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-                let result = client.execute(&sql, &params[..]).await?;
-                Ok(result)
+                __private::insert_many(self.pool.clone(), #table_name, records).await
             }
 
             pub async fn upsert_many<T, K, FC, FU>(
@@ -511,148 +440,21 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
                     return Ok(0);
                 }
 
-                let conflict_columns = conflict(#conflict_selector::new()).columns();
-                if conflict_columns.is_empty() {
-                    return Err("Conflict target cannot be empty".into());
-                }
-
-                let mut seen_conflict_columns = std::collections::HashSet::new();
-                for column in &conflict_columns {
-                    if !seen_conflict_columns.insert(*column) {
-                        return Err(format!("Duplicate conflict column: {}", column).into());
-                    }
-                }
-
-                let enum_casts: std::collections::HashMap<&str, &str> = [
-                    #(#enum_cast_entries),*
-                ].into_iter().collect();
-                let required_fields: Vec<&str> = vec![#(#required_fields),*];
-                let conflict_clause = conflict_columns.join(", ");
-                let mut insert_columns_template: Option<Vec<&str>> = None;
-                let mut update_columns_template: Option<Vec<&str>> = None;
-                let mut all_values: Vec<String> = Vec::with_capacity(records.len());
-                let mut all_params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![];
-                let mut param_idx = 1;
+                let mut batch = __private::UpsertBatch::new(
+                    #table_name,
+                    #casts_const,
+                    conflict(#conflict_selector::new()).columns(),
+                )?;
 
                 for record in records {
-                    let create_builder = create(#create_builder::new(self.pool.clone()), record.clone());
-                    let update_builder = update(#update_builder::new(self.pool.clone()), record);
-
-                    let (mut create_set_values, create_filters) =
-                        create_builder.into_core().into_parts();
-                    let (update_assignments, update_set_args, update_arithmetic, update_filters) =
-                        update_builder.into_core().into_parts();
-
-                    if !create_filters.is_empty() {
-                        return Err("upsert_many does not support create where clauses".into());
-                    }
-
-                    if !update_filters.is_empty() {
-                        return Err("upsert_many does not support update where clauses".into());
-                    }
-
-                    if !update_arithmetic.is_empty() {
-                        return Err("upsert_many does not support increment operations".into());
-                    }
-
-                    for req in &required_fields {
-                        if !create_set_values.contains_key(req) {
-                            return Err(format!("Missing required field: {}", req).into());
-                        }
-                    }
-
-                    if create_set_values.is_empty() {
-                        return Err("No fields to upsert".into());
-                    }
-
-                    for conflict_col in &conflict_columns {
-                        if !create_set_values.contains_key(conflict_col) {
-                            return Err(format!("Missing conflict field in create builder: {}", conflict_col).into());
-                        }
-                    }
-
-                    if update_assignments.len() != update_set_args.len() {
-                        return Err("Invalid update builder state".into());
-                    }
-
-                    let mut insert_columns: Vec<&str> = create_set_values.keys().copied().collect();
-                    insert_columns.sort();
-
-                    if let Some(expected) = &insert_columns_template {
-                        if expected != &insert_columns {
-                            return Err("upsert_many requires the same create columns for every record".into());
-                        }
-                    } else {
-                        insert_columns_template = Some(insert_columns.clone());
-                    }
-
-                    let mut seen_update_columns = std::collections::HashSet::new();
-                    let mut update_columns: Vec<&str> = Vec::new();
-
-                    for assignment in update_assignments {
-                        let col = assignment.column;
-                        if !seen_update_columns.insert(col) {
-                            return Err(format!("Duplicate update field in upsert_many: {}", col).into());
-                        }
-                        if !insert_columns.contains(&col) {
-                            return Err(format!("Update field '{}' must also be set in create builder", col).into());
-                        }
-                        update_columns.push(col);
-                    }
-
-                    update_columns.sort();
-
-                    if let Some(expected) = &update_columns_template {
-                        if expected != &update_columns {
-                            return Err("upsert_many requires the same update columns for every record".into());
-                        }
-                    } else {
-                        update_columns_template = Some(update_columns);
-                    }
-
-                    let placeholders: Vec<String> = insert_columns.iter().map(|col| {
-                        let placeholder = if let Some(enum_type) = enum_casts.get(col) {
-                            format!("${}::TEXT::{}", param_idx, enum_type)
-                        } else {
-                            format!("${}", param_idx)
-                        };
-                        param_idx += 1;
-                        placeholder
-                    }).collect();
-
-                    all_values.push(format!("({})", placeholders.join(", ")));
-
-                    for col in &insert_columns {
-                        all_params.push(create_set_values.remove(col).unwrap());
-                    }
+                    let create_core =
+                        create(#create_builder::new(self.pool.clone()), record.clone()).into_core();
+                    let update_core =
+                        update(#update_builder::new(self.pool.clone()), record).into_core();
+                    batch.push(create_core, update_core)?;
                 }
 
-                let insert_columns = insert_columns_template.ok_or("No fields to upsert")?;
-                let update_columns = update_columns_template.unwrap_or_default();
-                let columns_str = insert_columns.join(", ");
-                let sql = if update_columns.is_empty() {
-                    format!(
-                        "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO NOTHING",
-                        #table_name, columns_str, all_values.join(", "), conflict_clause
-                    )
-                } else {
-                    let update_clauses: Vec<String> = update_columns
-                        .iter()
-                        .map(|col| format!("{} = EXCLUDED.{}", col, col))
-                        .collect();
-                    format!(
-                        "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {}",
-                        #table_name, columns_str, all_values.join(", "), conflict_clause, update_clauses.join(", ")
-                    )
-                };
-
-                debug::log_query(&sql, all_params.len());
-
-                let client = self.pool.get().await.map_err(|_| "Failed to get connection from pool")?;
-                let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                    all_params.iter().map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-                let result = client.execute(&sql, &params[..]).await?;
-                Ok(result)
+                batch.execute(self.pool.clone()).await
             }
 
             #find_unique

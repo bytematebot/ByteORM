@@ -360,48 +360,120 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
             pub type SqlArg = Box<dyn tokio_postgres::types::ToSql + Sync + Send>;
             pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-            /// Collects WHERE predicates and their bound arguments.
+            /// One WHERE condition: either a structured predicate or a raw
+            /// clause supplied by the caller.
+            enum FilterEntry {
+                Predicate(WherePredicate),
+                Raw { clause: String, args: std::ops::Range<usize> },
+            }
+
+            /// Rewrites `$1..$n` in a caller-supplied clause so they continue
+            /// from `offset` instead of restarting at one.
+            fn shift_placeholders(clause: &str, offset: usize) -> String {
+                let mut out = String::with_capacity(clause.len());
+                let mut chars = clause.chars().peekable();
+                while let Some(ch) = chars.next() {
+                    if ch != '$' {
+                        out.push(ch);
+                        continue;
+                    }
+                    let mut digits = String::new();
+                    while let Some(digit) = chars.peek() {
+                        if digit.is_ascii_digit() {
+                            digits.push(*digit);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    match digits.parse::<usize>() {
+                        Ok(n) if n > 0 => out.push_str(&format!("${}", offset + n - 1)),
+                        _ => {
+                            out.push('$');
+                            out.push_str(&digits);
+                        }
+                    }
+                }
+                out
+            }
+
+            /// Collects WHERE conditions and their bound arguments.
             pub struct Filters {
-                predicates: Vec<WherePredicate>,
+                entries: Vec<FilterEntry>,
                 args: Vec<SqlArg>,
             }
 
             impl Filters {
                 pub fn new() -> Self {
-                    Self { predicates: vec![], args: vec![] }
+                    Self { entries: vec![], args: vec![] }
                 }
 
                 pub fn is_empty(&self) -> bool {
-                    self.predicates.is_empty()
+                    self.entries.is_empty()
+                }
+
+                /// Placeholder number the next argument would take.
+                pub fn next_placeholder(&self) -> usize {
+                    self.args.len() + 1
                 }
 
                 /// Records a predicate binding one argument.
                 pub fn push(&mut self, column: &'static str, op: WhereOp, value: SqlArg) {
                     let start = self.args.len();
                     self.args.push(value);
-                    self.predicates.push(WherePredicate::new(column, op, start..self.args.len()));
+                    self.entries.push(FilterEntry::Predicate(
+                        WherePredicate::new(column, op, start..self.args.len())
+                    ));
                 }
 
                 /// Records a predicate binding no arguments (IS NULL, IS NOT NULL).
                 pub fn push_bare(&mut self, column: &'static str, op: WhereOp) {
                     let at = self.args.len();
-                    self.predicates.push(WherePredicate::new(column, op, at..at));
+                    self.entries.push(FilterEntry::Predicate(
+                        WherePredicate::new(column, op, at..at)
+                    ));
                 }
 
                 /// Records an IN predicate over any number of arguments.
                 pub fn push_in(&mut self, column: &'static str, values: Vec<SqlArg>) {
                     let start = self.args.len();
                     self.args.extend(values);
-                    self.predicates.push(WherePredicate::new(column, WhereOp::In, start..self.args.len()));
+                    self.entries.push(FilterEntry::Predicate(
+                        WherePredicate::new(column, WhereOp::In, start..self.args.len())
+                    ));
+                }
+
+                /// Records a raw clause written against its own `$1..$n`.
+                pub fn push_raw(&mut self, clause: String, values: Vec<SqlArg>) {
+                    let start = self.args.len();
+                    self.args.extend(values);
+                    self.entries.push(FilterEntry::Raw { clause, args: start..self.args.len() });
                 }
 
                 /// Appends " WHERE ..." to `sql` and moves the arguments into
                 /// `params`, numbering placeholders from `params.len() + 1`.
                 pub fn append_to(&mut self, sql: &mut String, params: &mut Vec<SqlArg>) {
-                    if self.predicates.is_empty() {
+                    if self.entries.is_empty() {
                         return;
                     }
-                    let (clauses, _) = render_where_predicates(&self.predicates, params.len() + 1);
+
+                    let mut next = params.len() + 1;
+                    let mut clauses: Vec<String> = Vec::with_capacity(self.entries.len());
+                    for entry in self.entries.drain(..) {
+                        match entry {
+                            FilterEntry::Predicate(predicate) => {
+                                let (rendered, after) =
+                                    render_where_predicates(std::slice::from_ref(&predicate), next);
+                                next = after;
+                                clauses.extend(rendered);
+                            }
+                            FilterEntry::Raw { clause, args } => {
+                                clauses.push(shift_placeholders(&clause, next));
+                                next += args.len();
+                            }
+                        }
+                    }
+
                     sql.push_str(" WHERE ");
                     sql.push_str(&clauses.join(" AND "));
                     params.append(&mut self.args);
@@ -647,6 +719,375 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                     debug::log_query(&sql, params.len());
                     let refs = as_sql_refs(&params);
                     Ok(client.query_one(&sql, &refs[..]).await?)
+                }
+            }
+
+            /// Multi-row `INSERT`, shared by every model's `create_many`.
+            pub async fn insert_many(
+                pool: ConnectionPool,
+                table: &'static str,
+                records: Vec<std::collections::HashMap<&'static str, SqlArg>>,
+            ) -> Result<u64, BoxError> {
+                if records.is_empty() {
+                    return Ok(0);
+                }
+
+                let mut columns: Vec<&'static str> = records[0].keys().copied().collect();
+                columns.sort();
+                if columns.is_empty() {
+                    return Err("Cannot create records without any columns".into());
+                }
+
+                let mut tuples: Vec<String> = Vec::with_capacity(records.len());
+                let mut params: Vec<SqlArg> = Vec::new();
+
+                for mut record in records {
+                    let mut placeholders: Vec<String> = Vec::with_capacity(columns.len());
+                    for column in &columns {
+                        let value = record.remove(*column).ok_or_else(|| {
+                            format!("Record is missing column `{}` present in the first record", column)
+                        })?;
+                        placeholders.push(format!("${}", params.len() + 1));
+                        params.push(value);
+                    }
+                    if let Some(extra) = record.keys().next() {
+                        return Err(format!(
+                            "Record has column `{}` that is not present in the first record",
+                            extra
+                        )
+                        .into());
+                    }
+                    tuples.push(format!("({})", placeholders.join(", ")));
+                }
+
+                let sql = format!(
+                    "INSERT INTO {} ({}) VALUES {}",
+                    table,
+                    columns.join(", "),
+                    tuples.join(", ")
+                );
+
+                debug::log_query(&sql, params.len());
+                let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
+                let refs = as_sql_refs(&params);
+                Ok(client.execute(&sql, &refs[..]).await?)
+            }
+
+            /// Accumulates the rows of an `INSERT ... ON CONFLICT` batch.
+            /// Every record must set the same columns, which is what makes a
+            /// single multi-row statement possible.
+            pub struct UpsertBatch {
+                table: &'static str,
+                casts: &'static [(&'static str, &'static str)],
+                conflict_columns: Vec<&'static str>,
+                insert_columns: Option<Vec<&'static str>>,
+                update_columns: Option<Vec<&'static str>>,
+                tuples: Vec<String>,
+                params: Vec<SqlArg>,
+            }
+
+            impl UpsertBatch {
+                pub fn new(
+                    table: &'static str,
+                    casts: &'static [(&'static str, &'static str)],
+                    conflict_columns: Vec<&'static str>,
+                ) -> Result<Self, BoxError> {
+                    if conflict_columns.is_empty() {
+                        return Err("Conflict target cannot be empty".into());
+                    }
+                    let mut seen = std::collections::HashSet::new();
+                    for column in &conflict_columns {
+                        if !seen.insert(*column) {
+                            return Err(format!("Duplicate conflict column: {}", column).into());
+                        }
+                    }
+                    Ok(Self {
+                        table,
+                        casts,
+                        conflict_columns,
+                        insert_columns: None,
+                        update_columns: None,
+                        tuples: vec![],
+                        params: vec![],
+                    })
+                }
+
+                pub fn push(&mut self, create: CreateCore, update: UpdateCore) -> Result<(), BoxError> {
+                    create.check_required()?;
+                    let (mut values, create_filters) = create.into_parts();
+                    let (assignments, set_args, arithmetic, update_filters) = update.into_parts();
+
+                    if !create_filters.is_empty() {
+                        return Err("upsert_many does not support create where clauses".into());
+                    }
+                    if !update_filters.is_empty() {
+                        return Err("upsert_many does not support update where clauses".into());
+                    }
+                    if !arithmetic.is_empty() {
+                        return Err("upsert_many does not support increment operations".into());
+                    }
+                    if assignments.len() != set_args.len() {
+                        return Err("Invalid update builder state".into());
+                    }
+                    if values.is_empty() {
+                        return Err("No fields to upsert".into());
+                    }
+
+                    let mut insert_columns: Vec<&'static str> = values.keys().copied().collect();
+                    insert_columns.sort();
+
+                    for conflict_column in &self.conflict_columns {
+                        if !values.contains_key(conflict_column) {
+                            return Err(format!(
+                                "Missing conflict field in create builder: {}",
+                                conflict_column
+                            )
+                            .into());
+                        }
+                    }
+
+                    match &self.insert_columns {
+                        Some(expected) if expected != &insert_columns => {
+                            return Err("upsert_many requires the same create columns for every record".into());
+                        }
+                        Some(_) => {}
+                        None => self.insert_columns = Some(insert_columns.clone()),
+                    }
+
+                    let mut seen = std::collections::HashSet::new();
+                    let mut update_columns: Vec<&'static str> = Vec::new();
+                    for assignment in assignments {
+                        if !seen.insert(assignment.column) {
+                            return Err(format!(
+                                "Duplicate update field in upsert_many: {}",
+                                assignment.column
+                            )
+                            .into());
+                        }
+                        if !insert_columns.contains(&assignment.column) {
+                            return Err(format!(
+                                "Update field '{}' must also be set in create builder",
+                                assignment.column
+                            )
+                            .into());
+                        }
+                        update_columns.push(assignment.column);
+                    }
+                    update_columns.sort();
+
+                    match &self.update_columns {
+                        Some(expected) if expected != &update_columns => {
+                            return Err("upsert_many requires the same update columns for every record".into());
+                        }
+                        Some(_) => {}
+                        None => self.update_columns = Some(update_columns),
+                    }
+
+                    let mut placeholders: Vec<String> = Vec::with_capacity(insert_columns.len());
+                    for column in &insert_columns {
+                        let placeholder = self.params.len() + 1;
+                        match CreateCore::cast_for(self.casts, column) {
+                            Some(cast) => placeholders.push(format!("${}::TEXT::{}", placeholder, cast)),
+                            None => placeholders.push(format!("${}", placeholder)),
+                        }
+                        self.params.push(values.remove(column).expect("column was just listed"));
+                    }
+                    self.tuples.push(format!("({})", placeholders.join(", ")));
+                    Ok(())
+                }
+
+                pub async fn execute(self, pool: ConnectionPool) -> Result<u64, BoxError> {
+                    let insert_columns = self.insert_columns.ok_or("No fields to upsert")?;
+                    let update_columns = self.update_columns.unwrap_or_default();
+                    let conflict_clause = self.conflict_columns.join(", ");
+
+                    let sql = if update_columns.is_empty() {
+                        format!(
+                            "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO NOTHING",
+                            self.table,
+                            insert_columns.join(", "),
+                            self.tuples.join(", "),
+                            conflict_clause
+                        )
+                    } else {
+                        let assignments: Vec<String> = update_columns
+                            .iter()
+                            .map(|column| format!("{} = EXCLUDED.{}", column, column))
+                            .collect();
+                        format!(
+                            "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {}",
+                            self.table,
+                            insert_columns.join(", "),
+                            self.tuples.join(", "),
+                            conflict_clause,
+                            assignments.join(", ")
+                        )
+                    };
+
+                    debug::log_query(&sql, self.params.len());
+                    let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
+                    let refs = as_sql_refs(&self.params);
+                    Ok(client.execute(&sql, &refs[..]).await?)
+                }
+            }
+
+            pub struct QueryCore {
+                table: &'static str,
+                select_columns: &'static str,
+                filters: Filters,
+                order_by: Vec<(String, &'static str)>,
+                limit: Option<usize>,
+                offset: Option<usize>,
+                includes: Vec<String>,
+            }
+
+            impl QueryCore {
+                pub fn new(table: &'static str, select_columns: &'static str) -> Self {
+                    Self {
+                        table,
+                        select_columns,
+                        filters: Filters::new(),
+                        order_by: vec![],
+                        limit: None,
+                        offset: None,
+                        includes: vec![],
+                    }
+                }
+
+                pub fn filters(&mut self) -> &mut Filters {
+                    &mut self.filters
+                }
+
+                pub fn next_placeholder(&self) -> usize {
+                    self.filters.next_placeholder()
+                }
+
+                pub fn push_order(&mut self, expression: String, direction: &'static str) {
+                    self.order_by.push((expression, direction));
+                }
+
+                pub fn set_limit(&mut self, limit: usize) {
+                    self.limit = Some(limit);
+                }
+
+                pub fn set_offset(&mut self, offset: usize) {
+                    self.offset = Some(offset);
+                }
+
+                pub fn push_include(&mut self, subquery: String) {
+                    self.includes.push(subquery);
+                }
+
+                fn append_tail(&mut self, sql: &mut String) {
+                    if !self.order_by.is_empty() {
+                        let clauses: Vec<String> = self
+                            .order_by
+                            .iter()
+                            .map(|(expression, direction)| format!("{} {}", expression, direction))
+                            .collect();
+                        sql.push_str(" ORDER BY ");
+                        sql.push_str(&clauses.join(", "));
+                    }
+                    if let Some(limit) = self.limit {
+                        sql.push_str(&format!(" LIMIT {}", limit));
+                    }
+                    if let Some(offset) = self.offset {
+                        sql.push_str(&format!(" OFFSET {}", offset));
+                    }
+                }
+
+                pub fn build_select(&mut self) -> (String, Vec<SqlArg>) {
+                    let mut sql = format!("SELECT {} FROM {}", self.select_columns, self.table);
+                    let mut params: Vec<SqlArg> = vec![];
+                    self.filters.append_to(&mut sql, &mut params);
+                    self.append_tail(&mut sql);
+                    (sql, params)
+                }
+
+                /// Builds `SELECT <expression> FROM <table> [WHERE ...]` for
+                /// counts and aggregates, which ignore ordering and paging.
+                pub fn build_scalar(&mut self, expression: &str) -> (String, Vec<SqlArg>) {
+                    let mut sql = format!("SELECT {} FROM {}", expression, self.table);
+                    let mut params: Vec<SqlArg> = vec![];
+                    self.filters.append_to(&mut sql, &mut params);
+                    (sql, params)
+                }
+
+                pub async fn fetch(mut self, pool: ConnectionPool)
+                    -> Result<Vec<tokio_postgres::Row>, BoxError>
+                {
+                    let (sql, params) = self.build_select();
+                    debug::log_query(&sql, params.len());
+                    let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
+                    let refs = as_sql_refs(&params);
+                    Ok(client.query(&sql, &refs[..]).await?)
+                }
+
+                /// Wraps the select in `row_to_json`, adding any included
+                /// relations as sub-selects.
+                pub async fn fetch_json(mut self, pool: ConnectionPool)
+                    -> Result<Vec<serde_json::Value>, BoxError>
+                {
+                    let includes = std::mem::take(&mut self.includes);
+                    let mut inner = format!("SELECT * FROM {}", self.table);
+                    let mut params: Vec<SqlArg> = vec![];
+                    self.filters.append_to(&mut inner, &mut params);
+                    self.append_tail(&mut inner);
+
+                    let mut outer_select = "t.*".to_string();
+                    if !includes.is_empty() {
+                        outer_select.push_str(", ");
+                        outer_select.push_str(&includes.join(", "));
+                    }
+
+                    let sql = format!(
+                        "SELECT row_to_json(root) FROM (SELECT {} FROM ({}) t) root",
+                        outer_select, inner
+                    );
+
+                    debug::log_query(&sql, params.len());
+                    let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
+                    let refs = as_sql_refs(&params);
+                    let rows = client.query(&sql, &refs[..]).await?;
+                    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+                }
+
+                pub async fn count(mut self, pool: ConnectionPool) -> Result<i64, BoxError> {
+                    let (sql, params) = self.build_scalar("COUNT(*)");
+                    debug::log_query(&sql, params.len());
+                    let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
+                    let refs = as_sql_refs(&params);
+                    let row = client.query_one(&sql, &refs[..]).await?;
+                    Ok(row.get(0))
+                }
+
+                /// Runs a one-cell select and hands back the row, leaving the
+                /// typed `row.get(0)` to the caller.
+                pub async fn scalar(mut self, pool: ConnectionPool, expression: String)
+                    -> Result<tokio_postgres::Row, BoxError>
+                {
+                    let (sql, params) = self.build_scalar(&expression);
+                    debug::log_query(&sql, params.len());
+                    let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
+                    let refs = as_sql_refs(&params);
+                    Ok(client.query_one(&sql, &refs[..]).await?)
+                }
+
+                pub async fn sum_cast_i64(mut self, pool: ConnectionPool, field: &str)
+                    -> Result<i64, BoxError>
+                {
+                    let placeholder = self.next_placeholder();
+                    let expression = format!(
+                        "COALESCE(CAST(SUM({}) AS BIGINT), ${})",
+                        field, placeholder
+                    );
+                    let (sql, mut params) = self.build_scalar(&expression);
+                    params.push(Box::new(0i64));
+                    debug::log_query(&sql, params.len());
+                    let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
+                    let refs = as_sql_refs(&params);
+                    let row = client.query_one(&sql, &refs[..]).await?;
+                    Ok(row.get(0))
                 }
             }
 

@@ -37,3 +37,97 @@ pub fn derive_byteorm(input: TokenStream) -> TokenStream {
 
     TokenStream::from(expanded)
 }
+
+#[cfg(test)]
+mod size_probe {
+    use crate::codegen;
+    use crate::types::{Field, Model, Modifier};
+
+    fn model() -> Model {
+        let mut fields = vec![Field {
+            name: "id".to_string(),
+            type_name: "BigInt".to_string(),
+            modifiers: vec![Modifier::PrimaryKey],
+            attributes: vec![],
+        }];
+        for (name, ty) in [
+            ("user_id", "BigInt"),
+            ("name", "String"),
+            ("slug", "String"),
+            ("amount", "Int"),
+            ("active", "Boolean"),
+            ("created_at", "TimestamptZ"),
+            ("updated_at", "TimestamptZ"),
+        ] {
+            fields.push(Field {
+                name: name.to_string(),
+                type_name: ty.to_string(),
+                modifiers: vec![],
+                attributes: vec![],
+            });
+        }
+        Model {
+            name: "Probe".to_string(),
+            fields,
+            computed_fields: vec![],
+            table_name: "probe".to_string(),
+        }
+    }
+
+    #[test]
+    fn print_generated_sizes() {
+        let m = model();
+        let parts = [
+            (
+                "from_row",
+                codegen::utils::generate_from_row_impl(&m).to_string().len(),
+            ),
+            (
+                "model_impl",
+                codegen::model::generate_model_impl(&m).to_string().len(),
+            ),
+            (
+                "query",
+                codegen::query::generate_query_builder_struct(&m)
+                    .to_string()
+                    .len(),
+            ),
+            (
+                "update",
+                codegen::update::generate_update_builder(&m)
+                    .to_string()
+                    .len(),
+            ),
+            (
+                "create",
+                codegen::create::generate_create_builder(&m)
+                    .to_string()
+                    .len(),
+            ),
+            (
+                "delete",
+                codegen::delete::generate_delete_builder(&m)
+                    .to_string()
+                    .len(),
+            ),
+            (
+                "upsert",
+                codegen::upsert::generate_upsert_builder(&m)
+                    .to_string()
+                    .len(),
+            ),
+            (
+                "accessor",
+                codegen::client::generate_accessor(&m).to_string().len(),
+            ),
+        ];
+        let total: usize = parts.iter().map(|(_, n)| n).sum();
+        for (name, n) in parts {
+            println!(
+                "{name:12} {n:>8} chars  {:>5.1}%",
+                100.0 * n as f64 / total as f64
+            );
+        }
+        println!("{:12} {total:>8} chars", "TOTAL");
+    }
+}
