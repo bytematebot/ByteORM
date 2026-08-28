@@ -14,19 +14,6 @@ pub struct Field {
     pub attributes: Vec<Attribute>,
 }
 
-impl Field {
-    pub fn get_jsonb_default_path(&self) -> Option<String> {
-        if self.type_name == "JsonB" {
-            for attr in &self.attributes {
-                if attr.name == "jsonb_default" {
-                    return attr.args.clone();
-                }
-            }
-        }
-        None
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum Modifier {
     PrimaryKey,

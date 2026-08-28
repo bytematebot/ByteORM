@@ -1,8 +1,6 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 
-type Error = Box<dyn std::error::Error + Send + Sync>;
-
 pub fn generate_jsonb_ext() -> TokenStream {
     quote! {
         pub trait JsonbExt {

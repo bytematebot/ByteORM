@@ -4,26 +4,10 @@ use quote::{format_ident, quote};
 use std::collections::HashMap;
 use std::fs;
 
-pub mod client;
-pub mod create;
-pub mod debug;
-pub mod delete;
 pub mod jsonb;
-pub mod model;
-pub mod query;
-pub mod update;
-pub mod upsert;
 pub mod utils;
 
-pub use client::*;
-pub use create::*;
-pub use debug::*;
-pub use delete::*;
 pub use jsonb::*;
-pub use model::*;
-pub use query::*;
-pub use update::*;
-pub use upsert::*;
 pub use utils::*;
 
 pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
@@ -48,7 +32,7 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
     let enums_code = if !schema.enums.is_empty() {
         let enums = schema.enums.iter().map(|e| {
             let name = term_ident(&e.name);
-            let name_str = &e.name;
+            let _name_str = &e.name;
             let variants = e.values.iter().map(|v| {
                 let v_ident = term_ident(v);
                 quote! { #v_ident }

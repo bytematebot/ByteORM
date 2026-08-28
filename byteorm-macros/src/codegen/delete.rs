@@ -4,7 +4,7 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 pub fn generate_delete_builder(model: &Model) -> TokenStream {
-    let model_name = format_ident!("{}", model.name);
+    let _model_name = format_ident!("{}", model.name);
     let delete_builder_name = format_ident!("{}Delete", model.name);
     let table_name = model.name.to_lowercase();
 

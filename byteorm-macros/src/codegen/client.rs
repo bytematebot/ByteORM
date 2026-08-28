@@ -4,32 +4,20 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 struct FieldCategories<'a> {
-    pk_fields: Vec<&'a Field>,
     numeric_fields: Vec<&'a Field>,
 }
 
 impl<'a> FieldCategories<'a> {
     fn from_model(model: &'a Model) -> Self {
-        let mut pk_fields = Vec::new();
         let mut numeric_fields = Vec::new();
 
         for field in &model.fields {
-            if field
-                .modifiers
-                .iter()
-                .any(|m| matches!(m, Modifier::PrimaryKey))
-            {
-                pk_fields.push(field);
-            }
             if is_numeric_type(&field.type_name) {
                 numeric_fields.push(field);
             }
         }
 
-        Self {
-            pk_fields,
-            numeric_fields,
-        }
+        Self { numeric_fields }
     }
 }
 

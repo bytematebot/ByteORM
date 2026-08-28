@@ -1,6 +1,5 @@
 use crate::codegen::utils::{
-    generate_inc_methods, generate_select_columns, generate_set_methods, is_builtin_type,
-    is_numeric_type, rust_type_from_schema, to_snake_case,
+    generate_inc_methods, generate_select_columns, generate_set_methods, is_builtin_type, rust_type_from_schema, to_snake_case,
 };
 use crate::types::*;
 use proc_macro2::TokenStream;
@@ -33,7 +32,7 @@ pub fn generate_upsert_builder(model: &Model) -> TokenStream {
         };
     }
 
-    let all_fields: Vec<_> = model.fields.iter().collect();
+    let _all_fields: Vec<_> = model.fields.iter().collect();
 
     let where_methods = pk_fields.iter().map(|field| {
         let method_name = format_ident!("where_{}", to_snake_case(&field.name));
