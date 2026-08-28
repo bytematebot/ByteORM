@@ -429,26 +429,35 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
                 let client = self.pool.get().await.map_err(|_| "Failed to get connection from pool")?;
 
                 let first = &records[0];
-                let mut columns: Vec<&str> = first.keys().copied().collect();
+                let mut columns: Vec<&'static str> = first.keys().copied().collect();
                 columns.sort();
+                if columns.is_empty() {
+                    return Err("Cannot create records without any columns".into());
+                }
                 let columns_str = columns.join(", ");
 
                 let mut all_values: Vec<String> = Vec::with_capacity(records.len());
                 let mut all_params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
                 let mut param_idx = 1;
 
-                for record in records {
-                    let placeholders: Vec<String> = columns.iter().map(|_| {
-                        let p = format!("${}", param_idx);
-                        param_idx += 1;
-                        p
-                    }).collect();
-                    all_values.push(format!("({})", placeholders.join(", ")));
+                for mut record in records {
+                    let mut placeholders: Vec<String> = Vec::with_capacity(columns.len());
                     for col in &columns {
-                        if let Some(val) = record.get(col) {
-                            all_params.push(unsafe { std::ptr::read(val) });
-                        }
+                        let val = record.remove(*col).ok_or_else(|| {
+                            format!("Record is missing column `{}` present in the first record", col)
+                        })?;
+                        placeholders.push(format!("${}", param_idx));
+                        param_idx += 1;
+                        all_params.push(val);
                     }
+                    if let Some(extra) = record.keys().next() {
+                        return Err(format!(
+                            "Record has column `{}` that is not present in the first record",
+                            extra
+                        )
+                        .into());
+                    }
+                    all_values.push(format!("({})", placeholders.join(", ")));
                 }
 
                 let sql = format!(
