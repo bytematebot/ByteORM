@@ -23,6 +23,8 @@ fn generate_where_builder_methods(model: &Model) -> Vec<TokenStream> {
         let in_method = quote! {
             pub fn #method_in(mut self, values: Vec<#field_type>) -> Self {
                 if values.is_empty() {
+                    // `IN ()` is not valid SQL; an empty set matches nothing.
+                    self.where_clauses.push("1 = 0".to_string());
                     return self;
                 }
                 let start_idx = self.args.len() + 1;
@@ -755,5 +757,33 @@ pub fn generate_query_builder_struct(model: &Model) -> TokenStream {
         #where_builder_struct
 
         #builder_struct
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_where_builder_methods;
+    use crate::types::{Field, Model, Modifier};
+
+    #[test]
+    fn empty_in_matches_nothing_instead_of_dropping_the_filter() {
+        let model = Model {
+            name: "Post".to_string(),
+            fields: vec![Field {
+                name: "id".to_string(),
+                type_name: "BigInt".to_string(),
+                modifiers: vec![Modifier::PrimaryKey],
+                attributes: vec![],
+            }],
+            computed_fields: vec![],
+            table_name: "post".to_string(),
+        };
+
+        let code = generate_where_builder_methods(&model)
+            .iter()
+            .map(|m| m.to_string())
+            .collect::<String>();
+
+        assert!(code.contains("\"1 = 0\""));
     }
 }
