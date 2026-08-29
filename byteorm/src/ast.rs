@@ -107,22 +107,13 @@ impl Field {
         }
     }
 
+    /// A column is nullable unless it is explicitly marked `NotNull`; the
+    /// `Nullable` modifier is the default spelled out.
     pub fn is_nullable_column(&self) -> bool {
-        if self
+        !self
             .modifiers
             .iter()
             .any(|m| matches!(m, Modifier::NotNull))
-        {
-            false
-        } else if self
-            .modifiers
-            .iter()
-            .any(|m| matches!(m, Modifier::Nullable))
-        {
-            true
-        } else {
-            true
-        }
     }
 
     pub fn has_index(&self) -> bool {

@@ -30,12 +30,9 @@ fn parse_enum(pair: Pair<Rule>) -> Enum {
     let name = pairs.next().unwrap().as_str().to_string();
     let mut values = Vec::new();
     for pair in pairs {
-        match pair.as_rule() {
-            Rule::enum_value => {
-                let value = pair.into_inner().next().unwrap().as_str().to_string();
-                values.push(value);
-            }
-            _ => (),
+        if pair.as_rule() == Rule::enum_value {
+            let value = pair.into_inner().next().unwrap().as_str().to_string();
+            values.push(value);
         }
     }
     Enum { name, values }

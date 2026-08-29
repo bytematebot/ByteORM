@@ -1,7 +1,6 @@
 mod ast;
 mod parser;
 
-use pest::Parser;
 use pest_derive::Parser;
 
 pub mod rustgen;
@@ -9,7 +8,6 @@ pub mod rustgen;
 #[grammar = "grammar.pest"]
 pub struct SchemaParser;
 
-use ast::ForeignKeyAction;
 pub use ast::*;
 pub use parser::parse_schema;
 
@@ -125,10 +123,9 @@ pub mod diff {
                 if let Modifier::ForeignKey {
                     model: ref_model, ..
                 } = modifier
+                    && ref_model != &model.name
                 {
-                    if ref_model != &model.name {
-                        deps.push(ref_model.clone());
-                    }
+                    deps.push(ref_model.clone());
                 }
             }
         }
@@ -145,9 +142,7 @@ pub mod diff {
 
         for model in models {
             in_degree.entry(model.name.clone()).or_insert(0);
-            dependents
-                .entry(model.name.clone())
-                .or_insert_with(Vec::new);
+            dependents.entry(model.name.clone()).or_default();
         }
 
         for model in models {
@@ -265,15 +260,14 @@ pub mod diff {
                     for curr_field in &curr_model.fields {
                         if let Some(prev_field) =
                             prev_model.fields.iter().find(|f| f.name == curr_field.name)
+                            && FieldSignature::new(prev_field) != FieldSignature::new(curr_field)
                         {
-                            if FieldSignature::new(prev_field) != FieldSignature::new(curr_field) {
-                                changes.push(Change::AlterColumn {
-                                    table: curr_model.name.clone(),
-                                    column: curr_field.name.clone(),
-                                    old: prev_field.clone(),
-                                    new: curr_field.clone(),
-                                });
-                            }
+                            changes.push(Change::AlterColumn {
+                                table: curr_model.name.clone(),
+                                column: curr_field.name.clone(),
+                                old: prev_field.clone(),
+                                new: curr_field.clone(),
+                            });
                         }
                     }
 
@@ -361,31 +355,31 @@ pub mod codegen {
             }
         }
 
-        if field.is_sql_default() {
-            if let Some(value) = field.get_default_value() {
-                let sql_type = postgres_type(&field.type_name);
-                let known_types = [
-                    "BOOLEAN",
-                    "REAL",
-                    "INTEGER",
-                    "BIGINT",
-                    "SERIAL",
-                    "TEXT",
-                    "JSONB",
-                    "TIMESTAMP",
-                    "TIMESTAMP WITH TIME ZONE",
-                ];
-                if matches!(
-                    sql_type.as_str(),
-                    "BOOLEAN" | "REAL" | "INTEGER" | "BIGINT" | "SERIAL"
-                ) || value == "now()"
-                {
-                    sql.push_str(&format!(" DEFAULT {}", value));
-                } else if known_types.contains(&sql_type.as_str()) {
-                    sql.push_str(&format!(" DEFAULT '{}'", value));
-                } else {
-                    sql.push_str(&format!(" DEFAULT '{}'::{}", value, field.type_name));
-                }
+        if field.is_sql_default()
+            && let Some(value) = field.get_default_value()
+        {
+            let sql_type = postgres_type(&field.type_name);
+            let known_types = [
+                "BOOLEAN",
+                "REAL",
+                "INTEGER",
+                "BIGINT",
+                "SERIAL",
+                "TEXT",
+                "JSONB",
+                "TIMESTAMP",
+                "TIMESTAMP WITH TIME ZONE",
+            ];
+            if matches!(
+                sql_type.as_str(),
+                "BOOLEAN" | "REAL" | "INTEGER" | "BIGINT" | "SERIAL"
+            ) || value == "now()"
+            {
+                sql.push_str(&format!(" DEFAULT {}", value));
+            } else if known_types.contains(&sql_type.as_str()) {
+                sql.push_str(&format!(" DEFAULT '{}'", value));
+            } else {
+                sql.push_str(&format!(" DEFAULT '{}'::{}", value, field.type_name));
             }
         }
 
@@ -459,46 +453,46 @@ pub mod codegen {
                 }
 
                 for attr in &model.model_attributes {
-                    if attr.name == "index" {
-                        if let Some(args) = &attr.args {
-                            let table_name = model.name.to_lowercase();
-                            let args_content =
-                                args.trim_start_matches('(').trim_end_matches(')').trim();
+                    if attr.name == "index"
+                        && let Some(args) = &attr.args
+                    {
+                        let table_name = model.name.to_lowercase();
+                        let args_content =
+                            args.trim_start_matches('(').trim_end_matches(')').trim();
 
-                            if args_content.starts_with('[') && args_content.ends_with(']') {
-                                let fields: Vec<&str> = args_content[1..args_content.len() - 1]
-                                    .split(',')
-                                    .map(|s| s.trim())
-                                    .collect();
-                                let fields_str = fields.join("_");
-                                let index_name = format!("idx_{}_{}", table_name, fields_str);
-                                let fields_sql = fields.join(", ");
-                                sql.push_str(&format!(
-                                    " CREATE INDEX IF NOT EXISTS {} ON {} ({});",
-                                    index_name, table_name, fields_sql
-                                ));
-                            }
+                        if args_content.starts_with('[') && args_content.ends_with(']') {
+                            let fields: Vec<&str> = args_content[1..args_content.len() - 1]
+                                .split(',')
+                                .map(|s| s.trim())
+                                .collect();
+                            let fields_str = fields.join("_");
+                            let index_name = format!("idx_{}_{}", table_name, fields_str);
+                            let fields_sql = fields.join(", ");
+                            sql.push_str(&format!(
+                                " CREATE INDEX IF NOT EXISTS {} ON {} ({});",
+                                index_name, table_name, fields_sql
+                            ));
                         }
                     }
-                    if attr.name == "unique" {
-                        if let Some(args) = &attr.args {
-                            let table_name = model.name.to_lowercase();
-                            let args_content =
-                                args.trim_start_matches('(').trim_end_matches(')').trim();
+                    if attr.name == "unique"
+                        && let Some(args) = &attr.args
+                    {
+                        let table_name = model.name.to_lowercase();
+                        let args_content =
+                            args.trim_start_matches('(').trim_end_matches(')').trim();
 
-                            if args_content.starts_with('[') && args_content.ends_with(']') {
-                                let fields: Vec<&str> = args_content[1..args_content.len() - 1]
-                                    .split(',')
-                                    .map(|s| s.trim())
-                                    .collect();
-                                let fields_str = fields.join("_");
-                                let constraint_name = format!("uq_{}_{}", table_name, fields_str);
-                                let fields_sql = fields.join(", ");
-                                sql.push_str(&format!(
-                                    " ALTER TABLE {} ADD CONSTRAINT {} UNIQUE ({});",
-                                    table_name, constraint_name, fields_sql
-                                ));
-                            }
+                        if args_content.starts_with('[') && args_content.ends_with(']') {
+                            let fields: Vec<&str> = args_content[1..args_content.len() - 1]
+                                .split(',')
+                                .map(|s| s.trim())
+                                .collect();
+                            let fields_str = fields.join("_");
+                            let constraint_name = format!("uq_{}_{}", table_name, fields_str);
+                            let fields_sql = fields.join(", ");
+                            sql.push_str(&format!(
+                                " ALTER TABLE {} ADD CONSTRAINT {} UNIQUE ({});",
+                                table_name, constraint_name, fields_sql
+                            ));
                         }
                     }
                 }
@@ -696,7 +690,7 @@ pub mod db {
             .unwrap_or_else(|_| "host=localhost user=postgres dbname=byteorm".to_string());
 
         let root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         };
         let tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
@@ -731,7 +725,7 @@ pub mod db {
             Ok(client)
         } else {
             let root_store = rustls::RootCertStore {
-                roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
             };
             let tls_config = rustls::ClientConfig::builder()
                 .with_root_certificates(root_store)

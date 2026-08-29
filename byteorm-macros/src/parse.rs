@@ -31,14 +31,12 @@ fn parse_table_name(input: &DeriveInput) -> Option<String> {
             .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
             .ok()?;
         for meta in &nested {
-            if let Meta::NameValue(nv) = meta {
-                if nv.path.is_ident("table") {
-                    if let Expr::Lit(lit) = &nv.value {
-                        if let Lit::Str(s) = &lit.lit {
-                            return Some(s.value());
-                        }
-                    }
-                }
+            if let Meta::NameValue(nv) = meta
+                && nv.path.is_ident("table")
+                && let Expr::Lit(lit) = &nv.value
+                && let Lit::Str(s) = &lit.lit
+            {
+                return Some(s.value());
             }
         }
     }
@@ -55,37 +53,35 @@ fn parse_computed_fields(input: &DeriveInput) -> Vec<ComputedField> {
             .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated);
         if let Ok(nested) = nested {
             for meta in &nested {
-                if let Meta::List(list) = meta {
-                    if list.path.is_ident("computed") {
-                        let inner: syn::Result<syn::punctuated::Punctuated<Meta, syn::Token![,]>> =
-                            list.parse_args_with(syn::punctuated::Punctuated::parse_terminated);
-                        if let Ok(inner) = inner {
-                            let mut cf_name = None;
-                            let mut cf_expr = None;
-                            for m in &inner {
-                                if let Meta::NameValue(nv) = m {
-                                    if nv.path.is_ident("name") {
-                                        if let Expr::Lit(lit) = &nv.value {
-                                            if let Lit::Str(s) = &lit.lit {
-                                                cf_name = Some(s.value());
-                                            }
-                                        }
-                                    }
-                                    if nv.path.is_ident("expr") {
-                                        if let Expr::Lit(lit) = &nv.value {
-                                            if let Lit::Str(s) = &lit.lit {
-                                                cf_expr = Some(s.value());
-                                            }
-                                        }
-                                    }
+                if let Meta::List(list) = meta
+                    && list.path.is_ident("computed")
+                {
+                    let inner: syn::Result<syn::punctuated::Punctuated<Meta, syn::Token![,]>> =
+                        list.parse_args_with(syn::punctuated::Punctuated::parse_terminated);
+                    if let Ok(inner) = inner {
+                        let mut cf_name = None;
+                        let mut cf_expr = None;
+                        for m in &inner {
+                            if let Meta::NameValue(nv) = m {
+                                if nv.path.is_ident("name")
+                                    && let Expr::Lit(lit) = &nv.value
+                                    && let Lit::Str(s) = &lit.lit
+                                {
+                                    cf_name = Some(s.value());
+                                }
+                                if nv.path.is_ident("expr")
+                                    && let Expr::Lit(lit) = &nv.value
+                                    && let Lit::Str(s) = &lit.lit
+                                {
+                                    cf_expr = Some(s.value());
                                 }
                             }
-                            if let (Some(n), Some(e)) = (cf_name, cf_expr) {
-                                computed.push(ComputedField {
-                                    name: n,
-                                    expression: e,
-                                });
-                            }
+                        }
+                        if let (Some(n), Some(e)) = (cf_name, cf_expr) {
+                            computed.push(ComputedField {
+                                name: n,
+                                expression: e,
+                            });
                         }
                     }
                 }
@@ -134,32 +130,31 @@ fn parse_field(field: &syn::Field) -> Field {
                     }
                     Meta::NameValue(nv) => {
                         if nv.path.is_ident("jsonb_default") {
-                            if let Expr::Lit(lit) = &nv.value {
-                                if let Lit::Str(s) = &lit.lit {
-                                    attributes.push(Attribute {
-                                        name: "jsonb_default".to_string(),
-                                        args: Some(s.value()),
-                                    });
-                                }
+                            if let Expr::Lit(lit) = &nv.value
+                                && let Lit::Str(s) = &lit.lit
+                            {
+                                attributes.push(Attribute {
+                                    name: "jsonb_default".to_string(),
+                                    args: Some(s.value()),
+                                });
                             }
                         } else if nv.path.is_ident("sql_default") {
-                            if let Expr::Lit(lit) = &nv.value {
-                                if let Lit::Str(s) = &lit.lit {
-                                    attributes.push(Attribute {
-                                        name: "default".to_string(),
-                                        args: Some(s.value()),
-                                    });
-                                }
+                            if let Expr::Lit(lit) = &nv.value
+                                && let Lit::Str(s) = &lit.lit
+                            {
+                                attributes.push(Attribute {
+                                    name: "default".to_string(),
+                                    args: Some(s.value()),
+                                });
                             }
-                        } else if nv.path.is_ident("enum_type") {
-                            if let Expr::Lit(lit) = &nv.value {
-                                if let Lit::Str(s) = &lit.lit {
-                                    attributes.push(Attribute {
-                                        name: "enum_type".to_string(),
-                                        args: Some(s.value()),
-                                    });
-                                }
-                            }
+                        } else if nv.path.is_ident("enum_type")
+                            && let Expr::Lit(lit) = &nv.value
+                            && let Lit::Str(s) = &lit.lit
+                        {
+                            attributes.push(Attribute {
+                                name: "enum_type".to_string(),
+                                args: Some(s.value()),
+                            });
                         }
                     }
                     Meta::List(list) => {
@@ -172,19 +167,17 @@ fn parse_field(field: &syn::Field) -> Field {
                                 let mut fk_field = None;
                                 for m in &inner {
                                     if let Meta::NameValue(nv) = m {
-                                        if nv.path.is_ident("model") {
-                                            if let Expr::Lit(lit) = &nv.value {
-                                                if let Lit::Str(s) = &lit.lit {
-                                                    fk_model = Some(s.value());
-                                                }
-                                            }
+                                        if nv.path.is_ident("model")
+                                            && let Expr::Lit(lit) = &nv.value
+                                            && let Lit::Str(s) = &lit.lit
+                                        {
+                                            fk_model = Some(s.value());
                                         }
-                                        if nv.path.is_ident("field") {
-                                            if let Expr::Lit(lit) = &nv.value {
-                                                if let Lit::Str(s) = &lit.lit {
-                                                    fk_field = Some(s.value());
-                                                }
-                                            }
+                                        if nv.path.is_ident("field")
+                                            && let Expr::Lit(lit) = &nv.value
+                                            && let Lit::Str(s) = &lit.lit
+                                        {
+                                            fk_field = Some(s.value());
                                         }
                                     }
                                 }

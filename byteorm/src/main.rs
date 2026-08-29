@@ -253,12 +253,12 @@ async fn main() {
                 Err(e) => {
                     eprintln!("❌ Error: {}", e);
                     // Try to downcast to tokio_postgres::Error to get more details
-                    if let Some(db_err) = e.downcast_ref::<tokio_postgres::Error>() {
-                        if let Some(sql_state) = db_err.code() {
-                            eprintln!("  📍 Error details:");
-                            eprintln!("     Code: {:?}", sql_state);
-                            eprintln!("     Message: {}", db_err);
-                        }
+                    if let Some(db_err) = e.downcast_ref::<tokio_postgres::Error>()
+                        && let Some(sql_state) = db_err.code()
+                    {
+                        eprintln!("  📍 Error details:");
+                        eprintln!("     Code: {:?}", sql_state);
+                        eprintln!("     Message: {}", db_err);
                     }
                     eprintln!("Error executing SQL: {}", e);
                     eprintln!("Continuing to generate client from schema only.");
@@ -266,11 +266,9 @@ async fn main() {
                 }
             };
 
-            if executed {
-                if let Err(e) = snapshot::save_snapshot(&client, &schema).await {
-                    eprintln!("Error saving snapshot: {}", e);
-                    return;
-                }
+            if executed && let Err(e) = snapshot::save_snapshot(&client, &schema).await {
+                eprintln!("Error saving snapshot: {}", e);
+                return;
             }
 
             println!("\nGenerating byteorm-client crate...");
@@ -1393,41 +1391,6 @@ fn is_destructive_change(change: &diff::Change) -> bool {
     )
 }
 
-fn discover_schema_files() -> Vec<PathBuf> {
-    let current_dir = match env::current_dir() {
-        Ok(dir) => dir,
-        Err(_) => return vec![],
-    };
-
-    let byteorm_dir = current_dir.join("byteorm");
-
-    if byteorm_dir.exists() && byteorm_dir.is_dir() {
-        println!("📂 Using multi-schema directory: byteorm/");
-
-        let mut schema_files = Vec::new();
-
-        if let Ok(entries) = fs::read_dir(&byteorm_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("bo") {
-                    schema_files.push(path);
-                }
-            }
-        }
-
-        schema_files.sort();
-        return schema_files;
-    }
-
-    let single_schema = current_dir.join("schema.bo");
-    if single_schema.exists() {
-        println!("📄 Using single schema file: schema.bo");
-        return vec![single_schema];
-    }
-
-    vec![]
-}
-
 fn load_and_merge_schemas(files: &[PathBuf]) -> Result<Schema, Box<dyn std::error::Error>> {
     let mut all_models = Vec::new();
     let mut all_enums = Vec::new();
@@ -1494,10 +1457,10 @@ fn generate_client_package(
 /// Writes `content` only when it differs from what is on disk, so unchanged
 /// files keep their mtime and Cargo can treat the crate as fresh.
 fn write_if_changed(path: &Path, content: &str) -> Result<bool, Box<dyn std::error::Error>> {
-    if let Ok(existing) = fs::read_to_string(path) {
-        if existing == content {
-            return Ok(false);
-        }
+    if let Ok(existing) = fs::read_to_string(path)
+        && existing == content
+    {
+        return Ok(false);
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1543,12 +1506,10 @@ futures-util = "0.3.31"
 
 async fn self_update() -> Result<(), Box<dyn std::error::Error>> {
     use std::env;
-    use std::fs;
-    use std::process::Command;
 
     println!("Updating ByteORM from GitHub...");
 
-    let current_exe = env::current_exe()?;
+    let _current_exe = env::current_exe()?;
 
     #[cfg(target_os = "windows")]
     {

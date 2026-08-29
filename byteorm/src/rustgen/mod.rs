@@ -2406,10 +2406,10 @@ fn generate_derive_model(
                 } else {
                     attrs.push(quote! { #[byteorm(jsonb_default = #path)] });
                 }
-            } else if field.type_name == "JsonB" || field.type_name == "Jsonb" {
-                if let Some(default_val) = field.get_default_value() {
-                    attrs.push(quote! { #[byteorm(jsonb_default = #default_val)] });
-                }
+            } else if (field.type_name == "JsonB" || field.type_name == "Jsonb")
+                && let Some(default_val) = field.get_default_value()
+            {
+                attrs.push(quote! { #[byteorm(jsonb_default = #default_val)] });
             }
             if let Some(sql_default) = field.sql_default_literal() {
                 attrs.push(quote! { #[byteorm(sql_default = #sql_default)] });

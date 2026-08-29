@@ -230,15 +230,17 @@ fn column_mask(columns: &[String], selected: &[String]) -> u128 {
     })
 }
 
-pub fn pk_args(
-    model: &Model,
-) -> (
+/// Primary key pieces a generator needs: identifiers, Rust types, column
+/// names, `$n` placeholders and `&name` argument references.
+pub type PkArgs = (
     Vec<proc_macro2::Ident>,
     Vec<TokenStream>,
     Vec<String>,
     Vec<String>,
     Vec<TokenStream>,
-) {
+);
+
+pub fn pk_args(model: &Model) -> PkArgs {
     let pk_fields: Vec<_> = model
         .fields
         .iter()

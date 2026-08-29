@@ -26,20 +26,6 @@ pub fn rust_type_from_schema(type_name: &str, nullable: bool) -> TokenStream {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::rust_type_from_schema;
-
-    #[test]
-    fn maps_text_fields_to_string() {
-        assert_eq!(rust_type_from_schema("Text", false).to_string(), "String");
-        assert_eq!(
-            rust_type_from_schema("Text", true).to_string(),
-            "Option < String >"
-        );
-    }
-}
-
 pub fn to_snake_case(s: &str) -> String {
     let mut result = String::new();
     for (i, ch) in s.chars().enumerate() {
@@ -68,4 +54,18 @@ pub fn is_builtin_type(ty: &str) -> bool {
             | "Text"
             | "Date"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rust_type_from_schema;
+
+    #[test]
+    fn maps_text_fields_to_string() {
+        assert_eq!(rust_type_from_schema("Text", false).to_string(), "String");
+        assert_eq!(
+            rust_type_from_schema("Text", true).to_string(),
+            "Option < String >"
+        );
+    }
 }
