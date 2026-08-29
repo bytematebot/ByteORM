@@ -1,6 +1,5 @@
 use crate::codegen::utils::{
     generate_create_value_methods, generate_filter_methods, generate_select_columns,
-    is_builtin_type, to_snake_case,
 };
 use crate::types::*;
 use proc_macro2::TokenStream;
@@ -11,45 +10,11 @@ pub fn generate_create_builder(model: &Model) -> TokenStream {
     let create_builder_name = format_ident!("{}Create", model.name);
     let table_name = model.name.to_lowercase();
 
-    let required_fields: Vec<String> = model
-        .fields
-        .iter()
-        .filter(|field| {
-            !field.attributes.iter().any(|a| a.name == "default")
-                && !field
-                    .modifiers
-                    .iter()
-                    .any(|m| matches!(m, Modifier::Nullable))
-                && field.type_name != "Serial"
-        })
-        .map(|field| to_snake_case(&field.name))
-        .collect();
-
     let where_methods = generate_filter_methods(model, "core.filters()");
     let set_methods = generate_create_value_methods(model, "core");
     let select_columns = generate_select_columns(model);
 
-    let enum_cast_entries: Vec<TokenStream> = model
-        .fields
-        .iter()
-        .filter(|field| !is_builtin_type(&field.type_name))
-        .map(|field| {
-            let col_name = to_snake_case(&field.name);
-            let type_name = field.type_name.to_lowercase();
-            quote! { (#col_name, #type_name) }
-        })
-        .collect();
-
-    let required_const = format_ident!("{}_REQUIRED_COLUMNS", model.name.to_uppercase());
-    let casts_const = format_ident!("{}_ENUM_CASTS", model.name.to_uppercase());
-
     quote! {
-        #[doc(hidden)]
-        pub static #required_const: &[&str] = &[#(#required_fields),*];
-
-        #[doc(hidden)]
-        pub static #casts_const: &[(&str, &str)] = &[#(#enum_cast_entries),*];
-
         pub struct #create_builder_name {
             core: __private::CreateCore,
             pool: ConnectionPool,
@@ -62,8 +27,8 @@ pub fn generate_create_builder(model: &Model) -> TokenStream {
                     core: __private::CreateCore::new(
                         #table_name,
                         #select_columns,
-                        #required_const,
-                        #casts_const,
+                        <#model_name as crate::ModelMeta>::REQUIRED_COLUMNS,
+                        <#model_name as crate::ModelMeta>::ENUM_CASTS,
                     ),
                     pool,
                     fut: None,
@@ -90,8 +55,8 @@ pub fn generate_create_builder(model: &Model) -> TokenStream {
                         __private::CreateCore::new(
                             #table_name,
                             #select_columns,
-                            #required_const,
-                            #casts_const,
+                            <#model_name as crate::ModelMeta>::REQUIRED_COLUMNS,
+                            <#model_name as crate::ModelMeta>::ENUM_CASTS,
                         ),
                     );
                     me.fut = Some(Box::pin(core.execute(me.pool.clone())));

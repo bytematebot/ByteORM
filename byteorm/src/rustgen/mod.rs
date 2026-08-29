@@ -195,6 +195,8 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
     let jsonb_ext = generate_jsonb_ext();
 
     let lib_code = quote! {
+        #![allow(unused_imports)]
+
         use serde::{Deserialize, Serialize};
         use chrono::{DateTime, Utc};
         use tokio_postgres::{Client as PgClient, NoTls, Error};
@@ -213,6 +215,20 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
 
         pub trait FromRow {
             fn from_row(row: &tokio_postgres::Row) -> Self;
+        }
+
+        /// Everything the shared runtime needs to know about a model. Each
+        /// generated model implements this once; the builders are generic
+        /// over it, so their bodies exist a single time in the crate.
+        pub trait ModelMeta: FromRow + Sized {
+            const TABLE: &'static str;
+            const SELECT_COLUMNS: &'static str;
+            /// Columns whose values must be cast through text, with the enum
+            /// type to cast to.
+            const ENUM_CASTS: &'static [(&'static str, &'static str)];
+            /// Columns that an insert must provide.
+            const REQUIRED_COLUMNS: &'static [&'static str];
+            const PK_COLUMNS: &'static [&'static str];
         }
 
         #[derive(Debug)]
@@ -355,7 +371,7 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
         /// compiled once for the whole crate rather than once per model.
         #[doc(hidden)]
         pub mod __private {
-            use super::{ConnectionPool, WhereOp, WherePredicate, debug, render_where_predicates};
+            use super::{ConnectionPool, FromRow, ModelMeta, WhereOp, WherePredicate, debug, render_where_predicates};
 
             pub type SqlArg = Box<dyn tokio_postgres::types::ToSql + Sync + Send>;
             pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -1213,6 +1229,193 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                 }
             }
 
+            /// Query builder state: collects conditions but cannot run.
+            pub struct WhereOnly;
+
+            /// Query builder state: holds the pool and the in-flight future.
+            pub struct Executable {
+                pool: ConnectionPool,
+                fut: Option<std::pin::Pin<Box<dyn std::future::Future<
+                    Output = Result<Vec<tokio_postgres::Row>, BoxError>
+                > + Send>>>,
+            }
+
+            /// One query builder for every model and both states. Per-model
+            /// code only adds the typed `where_*` and `order_by_*` methods.
+            pub struct Query<M, S> {
+                core: QueryCore,
+                state: S,
+                model: std::marker::PhantomData<fn() -> M>,
+            }
+
+            impl<M, S> Query<M, S> {
+                pub fn core(&mut self) -> &mut QueryCore {
+                    &mut self.core
+                }
+
+                pub fn limit(mut self, limit: usize) -> Self {
+                    self.core.set_limit(limit);
+                    self
+                }
+
+                pub fn offset(mut self, offset: usize) -> Self {
+                    self.core.set_offset(offset);
+                    self
+                }
+
+                pub fn where_raw(
+                    mut self,
+                    clause: impl Into<String>,
+                    params: Vec<SqlArg>,
+                ) -> Self {
+                    self.core.filters().push_raw(clause.into(), params);
+                    self
+                }
+            }
+
+            impl<M: ModelMeta> Query<M, WhereOnly> {
+                pub fn new() -> Self {
+                    Self {
+                        core: QueryCore::new(M::TABLE, M::SELECT_COLUMNS),
+                        state: WhereOnly,
+                        model: std::marker::PhantomData,
+                    }
+                }
+            }
+
+            impl<M: ModelMeta> Default for Query<M, WhereOnly> {
+                fn default() -> Self {
+                    Self::new()
+                }
+            }
+
+            impl<M: ModelMeta> Query<M, Executable> {
+                pub fn new(pool: ConnectionPool) -> Self {
+                    Self {
+                        core: QueryCore::new(M::TABLE, M::SELECT_COLUMNS),
+                        state: Executable { pool, fut: None },
+                        model: std::marker::PhantomData,
+                    }
+                }
+
+                pub fn from_builder(pool: ConnectionPool, builder: Query<M, WhereOnly>) -> Self {
+                    Self {
+                        core: builder.core,
+                        state: Executable { pool, fut: None },
+                        model: std::marker::PhantomData,
+                    }
+                }
+
+                fn take_core(&mut self) -> QueryCore {
+                    std::mem::replace(&mut self.core, QueryCore::new(M::TABLE, M::SELECT_COLUMNS))
+                }
+
+                pub async fn find_many_json(mut self) -> Result<Vec<serde_json::Value>, BoxError> {
+                    let core = self.take_core();
+                    core.fetch_json(self.state.pool.clone()).await
+                }
+
+                pub async fn find_first_json(self) -> Result<Option<serde_json::Value>, BoxError> {
+                    let result = self.limit(1).find_many_json().await?;
+                    Ok(result.into_iter().next())
+                }
+
+                pub async fn first(self) -> Result<Option<M>, BoxError> {
+                    let result = self.limit(1).await?;
+                    Ok(result.into_iter().next())
+                }
+
+                pub async fn count(mut self) -> Result<i64, BoxError> {
+                    let core = self.take_core();
+                    core.count(self.state.pool.clone()).await
+                }
+
+                pub async fn aggregate<T>(mut self, field: &str, func: &str) -> Result<Option<T>, BoxError>
+                where
+                    T: for<'a> tokio_postgres::types::FromSql<'a>,
+                {
+                    let core = self.take_core();
+                    let row = core
+                        .scalar(self.state.pool.clone(), format!("{}({})", func.to_uppercase(), field))
+                        .await?;
+                    Ok(row.get(0))
+                }
+
+                pub async fn sum<T>(mut self, field: &str) -> Result<T, BoxError>
+                where
+                    T: for<'a> tokio_postgres::types::FromSql<'a>
+                        + Default
+                        + tokio_postgres::types::ToSql
+                        + Sync,
+                {
+                    let default_value = T::default();
+                    let mut core = self.take_core();
+                    let expression = format!("COALESCE(SUM({}), ${})", field, core.next_placeholder());
+                    let (sql, params) = core.build_scalar(&expression);
+
+                    let client = self.state.pool.get().await
+                        .map_err(|_| "Failed to get connection from pool")?;
+                    let mut refs = as_sql_refs(&params);
+                    refs.push(&default_value);
+                    debug::log_query(&sql, refs.len());
+                    let row = client.query_one(&sql, &refs[..]).await?;
+                    Ok(row.get(0))
+                }
+
+                pub async fn sum_cast_i64(mut self, field: &str) -> Result<i64, BoxError> {
+                    let core = self.take_core();
+                    core.sum_cast_i64(self.state.pool.clone(), field).await
+                }
+
+                pub async fn avg<T>(self, field: &str) -> Result<Option<T>, BoxError>
+                where
+                    T: for<'a> tokio_postgres::types::FromSql<'a>,
+                {
+                    self.aggregate(field, "AVG").await
+                }
+
+                pub async fn min<T>(self, field: &str) -> Result<Option<T>, BoxError>
+                where
+                    T: for<'a> tokio_postgres::types::FromSql<'a>,
+                {
+                    self.aggregate(field, "MIN").await
+                }
+
+                pub async fn max<T>(self, field: &str) -> Result<Option<T>, BoxError>
+                where
+                    T: for<'a> tokio_postgres::types::FromSql<'a>,
+                {
+                    self.aggregate(field, "MAX").await
+                }
+            }
+
+            impl<M: ModelMeta> std::future::Future for Query<M, Executable> {
+                type Output = Result<Vec<M>, BoxError>;
+
+                fn poll(
+                    mut self: std::pin::Pin<&mut Self>,
+                    cx: &mut std::task::Context<'_>,
+                ) -> std::task::Poll<Self::Output> {
+                    let me = &mut *self;
+
+                    if me.state.fut.is_none() {
+                        let core = std::mem::replace(
+                            &mut me.core,
+                            QueryCore::new(M::TABLE, M::SELECT_COLUMNS),
+                        );
+                        me.state.fut = Some(Box::pin(core.fetch(me.state.pool.clone())));
+                    }
+
+                    match me.state.fut.as_mut().unwrap().as_mut().poll(cx) {
+                        std::task::Poll::Ready(Ok(rows)) => std::task::Poll::Ready(Ok(
+                            rows.iter().map(|row| M::from_row(row)).collect()
+                        )),
+                        std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+                        std::task::Poll::Pending => std::task::Poll::Pending,
+                    }
+                }
+            }
+
             pub struct DeleteCore {
                 table: &'static str,
                 filters: Filters,
@@ -1655,6 +1858,10 @@ fn generate_derive_model(
         .collect();
 
     quote! {
+        // Which of these a model needs depends on its fields; the shared
+        // runtime covers the rest.
+        #![allow(unused_imports)]
+
         use serde::{Deserialize, Serialize};
         use chrono::{DateTime, NaiveDate, Utc};
         use std::sync::Arc;

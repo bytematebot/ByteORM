@@ -164,7 +164,6 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
 
     let find_unique = generate_find_unique(&model_name, model);
     let find_or_create = generate_find_or_create(&model_name, model, &table_name);
-    let casts_const = format_ident!("{}_ENUM_CASTS", model.name.to_uppercase());
 
     let conflict_selector_fields = model.fields.iter().map(|field| {
         let field_name = format_ident!("{}", to_snake_case(&field.name));
@@ -442,7 +441,7 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
 
                 let mut batch = __private::UpsertBatch::new(
                     #table_name,
-                    #casts_const,
+                    <#model_name as crate::ModelMeta>::ENUM_CASTS,
                     conflict(#conflict_selector::new()).columns(),
                 )?;
 

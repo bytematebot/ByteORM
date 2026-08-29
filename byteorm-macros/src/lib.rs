@@ -14,6 +14,7 @@ pub fn derive_byteorm(input: TokenStream) -> TokenStream {
     let model = parse::parse_model(&input);
 
     let from_row_impl = codegen::utils::generate_from_row_impl(&model);
+    let model_meta_impl = codegen::utils::generate_model_meta_impl(&model);
     let model_impl = codegen::model::generate_model_impl(&model);
     let query_builder = codegen::query::generate_query_builder_struct(&model);
     let update_builder = codegen::update::generate_update_builder(&model);
@@ -25,6 +26,7 @@ pub fn derive_byteorm(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         #from_row_impl
+        #model_meta_impl
         #model_impl
         #query_builder
         #update_builder
@@ -37,4 +39,3 @@ pub fn derive_byteorm(input: TokenStream) -> TokenStream {
 
     TokenStream::from(expanded)
 }
-

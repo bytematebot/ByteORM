@@ -92,14 +92,8 @@ pub fn generate_upsert_builder(model: &Model) -> TokenStream {
         });
 
     let select_columns = generate_select_columns(model);
-    let pk_col_names: Vec<String> = pk_fields.iter().map(|f| to_snake_case(&f.name)).collect();
-    let casts_const = format_ident!("{}_ENUM_CASTS", model.name.to_uppercase());
-    let pk_const = format_ident!("{}_PK_COLUMNS", model.name.to_uppercase());
 
     quote! {
-        #[doc(hidden)]
-        pub static #pk_const: &[&str] = &[#(#pk_col_names),*];
-
         pub struct #upsert_builder_name {
             core: __private::UpsertCore,
             pool: ConnectionPool,
@@ -112,8 +106,8 @@ pub fn generate_upsert_builder(model: &Model) -> TokenStream {
                     core: __private::UpsertCore::new(
                         #table_name,
                         #select_columns,
-                        #casts_const,
-                        #pk_const,
+                        <#model_name as crate::ModelMeta>::ENUM_CASTS,
+                        <#model_name as crate::ModelMeta>::PK_COLUMNS,
                     ),
                     pool,
                     fut: None,
@@ -136,8 +130,8 @@ pub fn generate_upsert_builder(model: &Model) -> TokenStream {
                         __private::UpsertCore::new(
                             #table_name,
                             #select_columns,
-                            #casts_const,
-                            #pk_const,
+                            <#model_name as crate::ModelMeta>::ENUM_CASTS,
+                            <#model_name as crate::ModelMeta>::PK_COLUMNS,
                         ),
                     );
                     me.fut = Some(Box::pin(core.execute(me.pool.clone())));

@@ -100,6 +100,61 @@ pub fn generate_from_row_impl(model: &Model) -> TokenStream {
     }
 }
 
+/// Emits the model's `ModelMeta` impl: the table, column list and the
+/// static tables the shared runtime consults instead of re-deriving them.
+pub fn generate_model_meta_impl(model: &Model) -> TokenStream {
+    let model_name = format_ident!("{}", model.name);
+    let table_name = model.name.to_lowercase();
+    let select_columns = generate_select_columns(model);
+
+    let enum_casts: Vec<TokenStream> = model
+        .fields
+        .iter()
+        .filter(|field| !is_builtin_type(&field.type_name))
+        .map(|field| {
+            let column = to_snake_case(&field.name);
+            let cast = field.type_name.to_lowercase();
+            quote! { (#column, #cast) }
+        })
+        .collect();
+
+    let required_columns: Vec<String> = model
+        .fields
+        .iter()
+        .filter(|field| {
+            !field.attributes.iter().any(|a| a.name == "default")
+                && !field
+                    .modifiers
+                    .iter()
+                    .any(|m| matches!(m, Modifier::Nullable))
+                && field.type_name != "Serial"
+        })
+        .map(|field| to_snake_case(&field.name))
+        .collect();
+
+    let pk_columns: Vec<String> = model
+        .fields
+        .iter()
+        .filter(|field| {
+            field
+                .modifiers
+                .iter()
+                .any(|m| matches!(m, Modifier::PrimaryKey))
+        })
+        .map(|field| to_snake_case(&field.name))
+        .collect();
+
+    quote! {
+        impl crate::ModelMeta for #model_name {
+            const TABLE: &'static str = #table_name;
+            const SELECT_COLUMNS: &'static str = #select_columns;
+            const ENUM_CASTS: &'static [(&'static str, &'static str)] = &[#(#enum_casts),*];
+            const REQUIRED_COLUMNS: &'static [&'static str] = &[#(#required_columns),*];
+            const PK_COLUMNS: &'static [&'static str] = &[#(#pk_columns),*];
+        }
+    }
+}
+
 pub fn pk_args(
     model: &Model,
 ) -> (
@@ -226,167 +281,6 @@ pub fn generate_filter_methods<'a>(
     })
 }
 
-fn generate_where_methods_inner<'a>(
-    model: &'a Model,
-    target_args: &'a str,
-    target_predicates: &'a str,
-) -> impl Iterator<Item = TokenStream> + 'a {
-    model.fields.iter().flat_map(move |field| {
-        let method_name = format_ident!("where_{}", to_snake_case(&field.name));
-        let method_in = format_ident!("where_{}_in", to_snake_case(&field.name));
-        let is_nullable = field.modifiers.iter().any(|m| matches!(m, Modifier::Nullable));
-        let field_type = rust_type_from_schema(&field.type_name, is_nullable);
-        let field_col = to_snake_case(&field.name);
-        let args_ident = format_ident!("{}", target_args);
-        let predicates_ident = format_ident!("{}", target_predicates);
-
-        let base_method = quote! {
-            pub fn #method_name(mut self, value: #field_type) -> Self {
-                let start = self.#args_ident.len();
-                self.#args_ident.push(Box::new(value) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>);
-                self.#predicates_ident.push(WherePredicate::new(#field_col, WhereOp::Eq, start..self.#args_ident.len()));
-                self
-            }
-        };
-        let in_method = quote! {
-            pub fn #method_in(mut self, values: Vec<#field_type>) -> Self {
-                let start = self.#args_ident.len();
-                for value in values {
-                    self.#args_ident.push(Box::new(value) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>);
-                }
-                self.#predicates_ident.push(WherePredicate::new(#field_col, WhereOp::In, start..self.#args_ident.len()));
-                self
-            }
-        };
-        let null_methods = if is_nullable {
-            let method_is_null = format_ident!("where_{}_is_null", to_snake_case(&field.name));
-            let method_is_not_null = format_ident!("where_{}_is_not_null", to_snake_case(&field.name));
-            vec![
-                quote! {
-                    pub fn #method_is_null(mut self) -> Self {
-                        let at = self.#args_ident.len();
-                        self.#predicates_ident.push(WherePredicate::new(#field_col, WhereOp::IsNull, at..at));
-                        self
-                    }
-                },
-                quote! {
-                    pub fn #method_is_not_null(mut self) -> Self {
-                        let at = self.#args_ident.len();
-                        self.#predicates_ident.push(WherePredicate::new(#field_col, WhereOp::IsNotNull, at..at));
-                        self
-                    }
-                }
-            ]
-        } else { vec![] };
-
-        let mut methods = vec![base_method, in_method];
-        methods.extend(null_methods);
-
-        if field.type_name == "TimestamptZ" {
-            let comparisons = [
-                (format_ident!("where_{}_gt", to_snake_case(&field.name)), format_ident!("Gt")),
-                (format_ident!("where_{}_lt", to_snake_case(&field.name)), format_ident!("Lt")),
-                (format_ident!("where_{}_gte", to_snake_case(&field.name)), format_ident!("Gte")),
-                (format_ident!("where_{}_lte", to_snake_case(&field.name)), format_ident!("Lte")),
-            ];
-            methods.extend(comparisons.into_iter().map(|(method, op)| {
-                let field_type = field_type.clone();
-                quote! {
-                    pub fn #method(mut self, value: #field_type) -> Self {
-                        let start = self.#args_ident.len();
-                        self.#args_ident.push(Box::new(value) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>);
-                        self.#predicates_ident.push(WherePredicate::new(#field_col, WhereOp::#op, start..self.#args_ident.len()));
-                        self
-                    }
-                }
-            }));
-        }
-        methods.into_iter()
-    })
-}
-
-pub fn generate_where_methods<'a>(
-    model: &'a Model,
-    target_args: &'a str,
-    target_predicates: &'a str,
-) -> impl Iterator<Item = TokenStream> + 'a {
-    generate_where_methods_inner(model, target_args, target_predicates)
-}
-
-pub fn generate_set_methods<'a>(
-    model: &'a Model,
-    use_hashmap: bool,
-    hashmap_field: &'a str,
-    vec_field: Option<&'a str>,
-    fragments_field: Option<&'a str>,
-) -> impl Iterator<Item = TokenStream> + 'a {
-    model.fields.iter().map(move |field| {
-        let method_name = format_ident!("set_{}", to_snake_case(&field.name));
-        let is_nullable = field.modifiers.iter().any(|m| matches!(m, Modifier::Nullable));
-        let field_type = rust_type_from_schema(&field.type_name, is_nullable);
-        let field_col = to_snake_case(&field.name);
-        let is_enum = !is_builtin_type(&field.type_name);
-        let is_string = matches!(field.type_name.as_str(), "String" | "Text");
-
-        if use_hashmap {
-            let map_ident = format_ident!("{}", hashmap_field);
-            if is_enum {
-                quote! {
-                    pub fn #method_name(mut self, value: #field_type) -> Self {
-                        self.#map_ident.insert(#field_col, Box::new(value.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>);
-                        self
-                    }
-                }
-            } else if is_string {
-                quote! {
-                    pub fn #method_name(mut self, value: impl Into<#field_type>) -> Self {
-                        self.#map_ident.insert(#field_col, Box::new(value.into()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>);
-                        self
-                    }
-                }
-            } else {
-                quote! {
-                    pub fn #method_name(mut self, value: #field_type) -> Self {
-                        self.#map_ident.insert(#field_col, Box::new(value) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>);
-                        self
-                    }
-                }
-            }
-        } else {
-            let vec_ident = format_ident!("{}", vec_field.unwrap_or("set_args"));
-            let frags_ident = format_ident!("{}", fragments_field.unwrap_or("set_fragments"));
-            if is_enum {
-                quote! {
-                    pub fn #method_name(mut self, value: #field_type) -> Self {
-                        self.#vec_ident.push(Box::new(value.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>);
-                        self.#frags_ident.push(#field_col);
-                        self
-                    }
-                }
-            } else if is_string {
-                quote! {
-                    pub fn #method_name(mut self, value: impl Into<#field_type>) -> Self {
-                        self.#vec_ident.push(Box::new(value.into()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>);
-                        self.#frags_ident.push(#field_col);
-                        self
-                    }
-                }
-            } else {
-                quote! {
-                    pub fn #method_name(mut self, value: #field_type) -> Self {
-                        self.#vec_ident.push(Box::new(value) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>);
-                        self.#frags_ident.push(#field_col);
-                        self
-                    }
-                }
-            }
-        }
-    })
-}
-
-/// Emits `set_*` methods for the create builder. Enum casts are applied by
-/// `CreateCore` from the model's static cast table, so the value only needs
-/// to arrive as text.
 pub fn generate_create_value_methods<'a>(
     model: &'a Model,
     target: &'a str,
@@ -516,52 +410,6 @@ pub fn generate_arithmetic_methods<'a>(
                     self.#c4.push_arithmetic(#f4, "div", divisor);
                     self
                 }
-            }
-        })
-}
-
-pub fn generate_inc_methods<'a>(
-    model: &'a Model,
-    target_ops: &'a str,
-    target_values: Option<&'a str>,
-) -> impl Iterator<Item = TokenStream> + 'a {
-    model.fields.iter()
-        .filter(|f| is_numeric_type(&f.type_name))
-        .map(move |field| {
-            let field_col = to_snake_case(&field.name);
-            let inc_method = format_ident!("inc_{}", field_col);
-            let dec_method = format_ident!("dec_{}", field_col);
-            let mul_method = format_ident!("mul_{}", field_col);
-            let div_method = format_ident!("div_{}", field_col);
-            let ops_ident = format_ident!("{}", target_ops);
-            let values_ident = target_values.map(|v| format_ident!("{}", v));
-
-            let inc_body = if let Some(values) = &values_ident {
-                quote! { self.#ops_ident.insert(#field_col, ("inc", amount)); self.#values.insert(#field_col, Box::new(amount)); }
-            } else {
-                quote! { self.#ops_ident.push((#field_col, "inc", amount)); }
-            };
-            let dec_body = if let Some(values) = &values_ident {
-                quote! { self.#ops_ident.insert(#field_col, ("dec", amount)); self.#values.insert(#field_col, Box::new(-amount)); }
-            } else {
-                quote! { self.#ops_ident.push((#field_col, "dec", amount)); }
-            };
-            let mul_body = if let Some(values) = &values_ident {
-                quote! { self.#ops_ident.insert(#field_col, ("mul", factor)); self.#values.insert(#field_col, Box::new(0)); }
-            } else {
-                quote! { self.#ops_ident.push((#field_col, "mul", factor)); }
-            };
-            let div_body = if let Some(values) = &values_ident {
-                quote! { self.#ops_ident.insert(#field_col, ("div", divisor)); self.#values.insert(#field_col, Box::new(0)); }
-            } else {
-                quote! { self.#ops_ident.push((#field_col, "div", divisor)); }
-            };
-
-            quote! {
-                pub fn #inc_method(mut self, amount: i64) -> Self { #inc_body self }
-                pub fn #dec_method(mut self, amount: i64) -> Self { #dec_body self }
-                pub fn #mul_method(mut self, factor: i64) -> Self { #mul_body self }
-                pub fn #div_method(mut self, divisor: i64) -> Self { #div_body self }
             }
         })
 }
