@@ -22,6 +22,7 @@ pub fn generate_jsonb_accessor_fields(
 }
 
 pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
+    let model_name = format_ident!("{}", model.name);
     let model_name_str = &model.name;
     let table_name = &model.table_name;
 
@@ -35,6 +36,7 @@ pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
         })
         .collect();
 
+    // Only touch updated_at on models that actually have the column.
     let has_updated_at = model
         .fields
         .iter()
@@ -56,299 +58,214 @@ pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
         })
         .collect();
 
-    jsonb_fields.into_iter().map(|jsonb| {
-        let jsonb_name = &jsonb.name;
-        let jsonb_snake = to_snake_case(jsonb_name);
-        let sub_accessor_struct = format_ident!("{}{}Accessor", model.name, capitalize_first(jsonb_name));
-        let defaults_const = format_ident!("{}_DEFAULTS", jsonb_snake.to_uppercase());
+    let (_, _, pk_columns, pk_placeholders, _) = pk_args(model);
 
-        let json_content = jsonb.attributes.iter()
-            .find(|a| a.name == "jsonb_default")
-            .and_then(|a| a.args.as_ref());
+    jsonb_fields
+        .into_iter()
+        .map(|jsonb| {
+            let jsonb_name = &jsonb.name;
+            let jsonb_snake = to_snake_case(jsonb_name);
+            let accessor_struct =
+                format_ident!("{}{}Accessor", model.name, capitalize_first(jsonb_name));
+            let field_marker =
+                format_ident!("{}{}Field", model.name, capitalize_first(jsonb_name));
+            let defaults_const = format_ident!("{}_DEFAULTS", jsonb_snake.to_uppercase());
 
-        let default_json_init = if let Some(content) = json_content {
-            quote! {
-                static #defaults_const: Lazy<serde_json::Value> = Lazy::new(|| {
-                    serde_json::from_str(#content)
-                        .expect(&format!("Failed to parse default JSON for {}.{}", #model_name_str, #jsonb_name))
+            let json_content = jsonb
+                .attributes
+                .iter()
+                .find(|a| a.name == "jsonb_default")
+                .and_then(|a| a.args.as_ref());
+
+            let default_json_init = match json_content {
+                Some(content) => quote! {
+                    static #defaults_const: Lazy<serde_json::Value> = Lazy::new(|| {
+                        serde_json::from_str(#content)
+                            .expect(&format!("Failed to parse default JSON for {}.{}", #model_name_str, #jsonb_name))
+                    });
+                },
+                None => quote! {
+                    static #defaults_const: Lazy<serde_json::Value> = Lazy::new(|| {
+                        serde_json::json!({})
+                    });
+                },
+            };
+
+            let pk_where_sql = pk_columns
+                .iter()
+                .zip(pk_placeholders.iter())
+                .map(|(col, placeholder)| format!("{} = {}", col, placeholder))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let select_one_sql = format!(
+                "SELECT {} FROM {} WHERE {}",
+                jsonb_snake, table_name, pk_where_sql
+            );
+            let select_by_ids_sql = match pk_columns.first() {
+                Some(pk_col) => format!(
+                    "SELECT {}, {} FROM {} WHERE {} = ANY($1)",
+                    pk_col, jsonb_snake, table_name, pk_col
+                ),
+                None => String::new(),
+            };
+            let set_sql = format!(
+                "INSERT INTO {} ({}, {}{}) VALUES ({}, jsonb_set('{{}}'::jsonb, string_to_array(${}, '.')::text[], ${}::jsonb, true){}) \
+                 ON CONFLICT ({}) DO UPDATE SET {} = jsonb_set(COALESCE({}.{}, '{{}}'::jsonb), string_to_array(${}, '.')::text[], ${}::jsonb, true){}",
+                table_name,
+                pk_columns.join(", "),
+                jsonb_snake,
+                updated_at_column,
+                pk_placeholders.join(", "),
+                pk_columns.len() + 1,
+                pk_columns.len() + 2,
+                updated_at_value,
+                pk_columns.join(", "),
+                jsonb_snake,
+                table_name,
+                jsonb_snake,
+                pk_columns.len() + 1,
+                pk_columns.len() + 2,
+                updated_at_assignment,
+            );
+
+            // Thin per-field wrappers keep the call-site arity of the primary
+            // key; everything below them is the shared JsonbAccessor.
+            let (pk_params, pk_refs) = if pk_fields.len() == 1 {
+                let pk = &pk_fields[0];
+                let is_nullable = pk.modifiers.iter().any(|m| matches!(m, Modifier::Nullable));
+                let pk_type = rust_type_from_schema(&pk.type_name, is_nullable);
+                (quote! { id: #pk_type }, quote! { &[&id] })
+            } else {
+                let params = pk_fields.iter().map(|pk| {
+                    let name = format_ident!("{}", to_snake_case(&pk.name));
+                    let is_nullable = pk.modifiers.iter().any(|m| matches!(m, Modifier::Nullable));
+                    let pk_type = rust_type_from_schema(&pk.type_name, is_nullable);
+                    quote! { #name: #pk_type }
                 });
-            }
-        } else {
-            quote! {
-                static #defaults_const: Lazy<serde_json::Value> = Lazy::new(|| {
-                    serde_json::json!({})
+                let refs = pk_fields.iter().map(|pk| {
+                    let name = format_ident!("{}", to_snake_case(&pk.name));
+                    quote! { &#name }
                 });
-            }
-        };
+                (quote! { #(#params),* }, quote! { &[#(#refs),*] })
+            };
 
-        let (pk_params, pk_args_for_set) = if pk_fields.len() == 1 {
-            let pk = &pk_fields[0];
-            let is_pk_nullable = pk.modifiers.iter().any(|m| matches!(m, Modifier::Nullable));
-            let pk_type = rust_type_from_schema(&pk.type_name, is_pk_nullable);
-            (quote! { id: #pk_type }, vec![quote! { &id }])
-        } else {
-            let params = pk_fields.iter().map(|pk| {
-                let param_name = format_ident!("{}", to_snake_case(&pk.name));
-                let is_pk_nullable = pk.modifiers.iter().any(|m| matches!(m, Modifier::Nullable));
-                let pk_type = rust_type_from_schema(&pk.type_name, is_pk_nullable);
-                quote! { #param_name: #pk_type }
-            });
-            let set_args = pk_fields.iter().map(|pk| {
-                let param_name = format_ident!("{}", to_snake_case(&pk.name));
-                quote! { &#param_name }
-            });
-            (quote! { #(#params),* }, set_args.collect::<Vec<_>>())
-        };
+            let pk_field_type = if pk_fields.len() == 1 {
+                let pk = &pk_fields[0];
+                let is_nullable = pk.modifiers.iter().any(|m| matches!(m, Modifier::Nullable));
+                rust_type_from_schema(&pk.type_name, is_nullable)
+            } else {
+                quote! { () }
+            };
 
-        let pk_field_type = if pk_fields.len() == 1 {
-            let pk = &pk_fields[0];
-            let is_pk_nullable = pk.modifiers.iter().any(|m| matches!(m, Modifier::Nullable));
-            rust_type_from_schema(&pk.type_name, is_pk_nullable)
-        } else {
-            quote! { () }
-        };
+            quote! {
+                #default_json_init
 
-        let pk_args_clone = if pk_fields.len() == 1 {
-            quote! { id }
-        } else {
-            let args = pk_fields.iter().map(|pk| {
-                let param_name = format_ident!("{}", to_snake_case(&pk.name));
-                quote! { #param_name }
-            });
-            quote! { #(#args),* }
-        };
+                #[doc(hidden)]
+                pub enum #field_marker {}
 
-        let (_, _, pk_columns, pk_placeholders, _) = pk_args(model);
-        let insert_pk_part = pk_columns.join(", ");
-        let insert_values_part = pk_placeholders.join(", ");
-        let conflict_clause = pk_columns.join(", ");
-        let key_placeholder = format!("${}", pk_columns.len() + 1);
-        let value_placeholder = format!("${}", pk_columns.len() + 2);
+                impl __private::JsonbField<#model_name> for #field_marker {
+                    const SELECT_ONE_SQL: &'static str = #select_one_sql;
+                    const SELECT_BY_IDS_SQL: &'static str = #select_by_ids_sql;
+                    const SET_SQL: &'static str = #set_sql;
 
-        let pk_where_sql = pk_columns
-            .iter()
-            .zip(pk_placeholders.iter())
-            .map(|(col, placeholder)| format!("{} = {}", col, placeholder))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let select_one_sql = format!(
-            "SELECT {} FROM {} WHERE {}",
-            jsonb_snake, table_name, pk_where_sql
-        );
-        let select_by_ids_sql = match pk_columns.first() {
-            Some(pk_col) => format!(
-                "SELECT {}, {} FROM {} WHERE {} = ANY($1)",
-                pk_col, jsonb_snake, table_name, pk_col
-            ),
-            None => String::new(),
-        };
-
-        quote! {
-            #default_json_init
-
-            #[derive(Clone)]
-            pub struct #sub_accessor_struct {
-                pool: ConnectionPool,
-            }
-
-            impl std::fmt::Debug for #sub_accessor_struct {
-                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    f.debug_struct(stringify!(#sub_accessor_struct))
-                        .field("pool", &"<bb8::Pool>")
-                        .finish()
-                }
-            }
-
-            impl #sub_accessor_struct {
-                pub fn new(pool: ConnectionPool) -> Self {
-                    Self { pool }
-                }
-
-                /// Reads just the JSONB column instead of the whole row.
-                /// A missing row and a NULL column both come back as None,
-                /// which callers resolve to the compiled-in defaults.
-                async fn fetch_jsonb(&self, #pk_params)
-                    -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>
-                {
-                    let client = self.pool.get().await
-                        .map_err(|e| format!("Failed to get database connection from pool: {}", e))?;
-
-                    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                        vec![#(#pk_args_for_set as &(dyn tokio_postgres::types::ToSql + Sync)),*];
-                    debug::log_query(#select_one_sql, params.len());
-
-                    let row = client.query_opt(#select_one_sql, &params[..]).await?;
-                    Ok(row.and_then(|row| row.get::<_, Option<serde_json::Value>>(0)))
-                }
-
-                pub async fn get_all(&self, #pk_params)
-                    -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>
-                {
-                    Ok(self.fetch_jsonb(#pk_args_clone).await?
-                        .unwrap_or_else(|| #defaults_const.clone()))
-                }
-
-                pub async fn get_all_as<T>(&self, #pk_params)
-                    -> Result<T, Box<dyn std::error::Error + Send + Sync>>
-                where
-                    T: serde::de::DeserializeOwned,
-                {
-                    let value = self.get_all(#pk_args_clone).await?;
-                    Ok(serde_json::from_value(value)?)
-                }
-
-                pub async fn get(&self, #pk_params, key: &str)
-                    -> Result<String, Box<dyn std::error::Error + Send + Sync>>
-                {
-                    match self.fetch_jsonb(#pk_args_clone).await? {
-                        Some(value) => value.get_string(key)
-                            .or_else(|_| #defaults_const.get_string(key)),
-                        None => #defaults_const.get_string(key),
+                    fn defaults() -> &'static serde_json::Value {
+                        &#defaults_const
                     }
                 }
 
-                pub async fn get_as<T>(&self, #pk_params, key: &str)
-                    -> Result<T, Box<dyn std::error::Error + Send + Sync>>
-                where
-                    T: serde::de::DeserializeOwned,
-                {
-                    match self.fetch_jsonb(#pk_args_clone).await? {
-                        Some(value) => value.get_value(key)
-                            .or_else(|_| #defaults_const.get_value(key)),
-                        None => #defaults_const.get_value(key),
+                #[derive(Clone)]
+                pub struct #accessor_struct {
+                    inner: __private::JsonbAccessor<#model_name, #field_marker>,
+                }
+
+                impl std::fmt::Debug for #accessor_struct {
+                    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.debug_struct(stringify!(#accessor_struct))
+                            .field("pool", &"<bb8::Pool>")
+                            .finish()
                     }
                 }
 
-                pub async fn get_or<T>(&self, #pk_params, key: &str, default: T)
-                    -> Result<T, Box<dyn std::error::Error + Send + Sync>>
-                where
-                    T: serde::de::DeserializeOwned,
-                {
-                    match self.get_as(#pk_args_clone, key).await {
-                        Ok(value) => Ok(value),
-                        Err(_) => Ok(default),
-                    }
-                }
-
-                pub async fn has(&self, #pk_params, key: &str)
-                    -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
-                {
-                    match self.fetch_jsonb(#pk_args_clone).await? {
-                        Some(value) => Ok(value.has_key(key) || #defaults_const.has_key(key)),
-                        None => Ok(#defaults_const.has_key(key)),
-                    }
-                }
-
-                pub async fn set<T>(&self, #pk_params, key: &str, value: T)
-                    -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-                where
-                    T: serde::Serialize + Send + Sync,
-                {
-                    let value_json = serde_json::to_value(&value)
-                        .map_err(|e| format!("Failed to serialize value for key '{}': {}", key, e))?;
-
-                    let sql = format!(
-                        "INSERT INTO {} ({}, {}{}) VALUES ({}, jsonb_set('{{}}'::jsonb, string_to_array({}, '.')::text[], {}::jsonb, true){}) \
-                         ON CONFLICT ({}) DO UPDATE SET {} = jsonb_set(COALESCE({}.{}, '{{}}'::jsonb), string_to_array({}, '.')::text[], {}::jsonb, true){}",
-                        #table_name,
-                        #insert_pk_part,
-                        #jsonb_snake,
-                        #updated_at_column,
-                        #insert_values_part,
-                        #key_placeholder,
-                        #value_placeholder,
-                        #updated_at_value,
-                        #conflict_clause,
-                        #jsonb_snake,
-                        #table_name,
-                        #jsonb_snake,
-                        #key_placeholder,
-                        #value_placeholder,
-                        #updated_at_assignment,
-                    );
-
-                    let client = self.pool.get().await
-                        .map_err(|e| format!("Failed to get database connection from pool: {}", e))?;
-
-                    let params = vec![#(#pk_args_for_set),*, &key as &(dyn tokio_postgres::types::ToSql + Sync), &value_json as &(dyn tokio_postgres::types::ToSql + Sync)];
-                    debug::log_query(&sql, params.len());
-
-                    client.execute(
-                        &sql,
-                        &params[..]
-                    ).await
-                        .map_err(|e| format!("Database error setting key '{}': {} (SQL: {}, value: {:?})", key, e, sql, value_json))?;
-
-                    Ok(())
-                }
-
-                pub async fn get_many(
-                    &self, #pk_params, keys: &[&str]
-                ) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>
-                {
-                    let stored = self.fetch_jsonb(#pk_args_clone).await?;
-
-                    let mut out = HashMap::new();
-                    for &key in keys {
-                        if let Some(value) = stored.as_ref().and_then(|stored| stored.get(key)) {
-                            out.insert(key.to_string(), value.clone());
-                        } else if let Some(value) = #defaults_const.get(key) {
-                            out.insert(key.to_string(), value.clone());
-                        }
-                    }
-                    Ok(out)
-                }
-
-                pub async fn get_many_as<T>(
-                    &self, #pk_params, keys: &[&str]
-                ) -> Result<HashMap<String, T>, Box<dyn std::error::Error + Send + Sync>>
-                where T: serde::de::DeserializeOwned
-                {
-                    let values = self.get_many(#pk_args_clone, keys).await?;
-                    let mut map = HashMap::new();
-                    for (k, v) in values {
-                        if let Ok(x) = serde_json::from_value::<T>(v) {
-                            map.insert(k, x);
-                        }
-                    }
-                    Ok(map)
-                }
-
-                pub async fn get_many_ids<T>(
-                    &self, ids: &[#pk_field_type], key: &str
-                ) -> Result<HashMap<#pk_field_type, T>, Box<dyn std::error::Error + Send + Sync>>
-                where T: serde::de::DeserializeOwned
-                {
-                    if ids.is_empty() {
-                        return Ok(HashMap::new());
+                impl #accessor_struct {
+                    pub fn new(pool: ConnectionPool) -> Self {
+                        Self { inner: __private::JsonbAccessor::new(pool) }
                     }
 
-                    let client = self.pool.get().await
-                        .map_err(|e| format!("Failed to get database connection from pool: {}", e))?;
-
-                    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                        vec![&ids as &(dyn tokio_postgres::types::ToSql + Sync)];
-                    debug::log_query(#select_by_ids_sql, params.len());
-
-                    let rows = client.query(#select_by_ids_sql, &params[..]).await?;
-
-                    let mut map = HashMap::new();
-                    for row in rows {
-                        let id: #pk_field_type = row.get(0);
-                        let stored: Option<serde_json::Value> = row.get(1);
-                        let value = stored
-                            .as_ref()
-                            .and_then(|stored| stored.get_value::<T>(key).ok())
-                            .or_else(|| #defaults_const.get_value::<T>(key).ok());
-                        if let Some(value) = value {
-                            map.insert(id, value);
-                        }
+                    pub async fn get_all(&self, #pk_params)
+                        -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>
+                    {
+                        self.inner.get_all(#pk_refs).await
                     }
-                    Ok(map)
+
+                    pub async fn get_all_as<T>(&self, #pk_params)
+                        -> Result<T, Box<dyn std::error::Error + Send + Sync>>
+                    where
+                        T: serde::de::DeserializeOwned,
+                    {
+                        self.inner.get_all_as(#pk_refs).await
+                    }
+
+                    pub async fn get(&self, #pk_params, key: &str)
+                        -> Result<String, Box<dyn std::error::Error + Send + Sync>>
+                    {
+                        self.inner.get(#pk_refs, key).await
+                    }
+
+                    pub async fn get_as<T>(&self, #pk_params, key: &str)
+                        -> Result<T, Box<dyn std::error::Error + Send + Sync>>
+                    where
+                        T: serde::de::DeserializeOwned,
+                    {
+                        self.inner.get_as(#pk_refs, key).await
+                    }
+
+                    pub async fn get_or<T>(&self, #pk_params, key: &str, default: T)
+                        -> Result<T, Box<dyn std::error::Error + Send + Sync>>
+                    where
+                        T: serde::de::DeserializeOwned,
+                    {
+                        self.inner.get_or(#pk_refs, key, default).await
+                    }
+
+                    pub async fn has(&self, #pk_params, key: &str)
+                        -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
+                    {
+                        self.inner.has(#pk_refs, key).await
+                    }
+
+                    pub async fn set<T>(&self, #pk_params, key: &str, value: T)
+                        -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+                    where
+                        T: serde::Serialize + Send + Sync,
+                    {
+                        self.inner.set(#pk_refs, key, value).await
+                    }
+
+                    pub async fn get_many(&self, #pk_params, keys: &[&str])
+                        -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>
+                    {
+                        self.inner.get_many(#pk_refs, keys).await
+                    }
+
+                    pub async fn get_many_as<T>(&self, #pk_params, keys: &[&str])
+                        -> Result<HashMap<String, T>, Box<dyn std::error::Error + Send + Sync>>
+                    where
+                        T: serde::de::DeserializeOwned,
+                    {
+                        self.inner.get_many_as(#pk_refs, keys).await
+                    }
+
+                    pub async fn get_many_ids<T>(&self, ids: &[#pk_field_type], key: &str)
+                        -> Result<HashMap<#pk_field_type, T>, Box<dyn std::error::Error + Send + Sync>>
+                    where
+                        T: serde::de::DeserializeOwned,
+                    {
+                        self.inner.get_many_ids(ids, key).await
+                    }
                 }
             }
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -409,14 +326,20 @@ mod tests {
     #[test]
     fn set_touches_updated_at_only_when_the_column_exists() {
         let with = generate_jsonb_sub_accessors(&model_with(vec![pk(), jsonb(), updated_at()]));
-        let code = with[0].to_string();
-        assert!(code.contains("\", updated_at\""));
-        assert!(code.contains("\", NOW()\""));
-        assert!(code.contains("\", updated_at = NOW()\""));
+        assert!(with[0].to_string().contains("updated_at = NOW()"));
 
         let without = generate_jsonb_sub_accessors(&model_with(vec![pk(), jsonb()]));
         let code = without[0].to_string();
         assert!(!code.contains("updated_at"));
         assert!(!code.contains("NOW()"));
+    }
+
+    #[test]
+    fn behaviour_lives_in_the_shared_accessor() {
+        let accessors = generate_jsonb_sub_accessors(&model_with(vec![pk(), jsonb()]));
+        let code = accessors[0].to_string();
+
+        assert!(code.contains("__private :: JsonbAccessor"));
+        assert!(!code.contains("query_opt"));
     }
 }

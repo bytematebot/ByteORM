@@ -389,7 +389,7 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
         /// compiled once for the whole crate rather than once per model.
         #[doc(hidden)]
         pub mod __private {
-            use super::{ConnectionPool, FromRow, ModelMeta, WhereOp, WherePredicate, debug, render_where_predicates};
+            use super::{ConnectionPool, FromRow, JsonbExt, ModelMeta, WhereOp, WherePredicate, debug, render_where_predicates};
 
             pub type SqlArg = Box<dyn tokio_postgres::types::ToSql + Sync + Send>;
             pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -1471,6 +1471,203 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
             }
 
             #tuple_conflict_impls
+
+            /// Describes one JSONB column with a compiled-in default
+            /// document. The statements are built by the generator; the
+            /// behaviour around them lives here, once.
+            pub trait JsonbField<M> {
+                /// `SELECT <column> FROM <table> WHERE <pk> = $1 [...]`
+                const SELECT_ONE_SQL: &'static str;
+                /// `SELECT <pk>, <column> FROM <table> WHERE <pk> = ANY($1)`
+                const SELECT_BY_IDS_SQL: &'static str;
+                /// Upsert of a single key inside the document.
+                const SET_SQL: &'static str;
+
+                fn defaults() -> &'static serde_json::Value;
+            }
+
+            /// Reads and writes single keys inside a JSONB column, falling
+            /// back to the compiled-in defaults.
+            pub struct JsonbAccessor<M, F> {
+                pool: ConnectionPool,
+                field: std::marker::PhantomData<fn() -> (M, F)>,
+            }
+
+            impl<M, F> Clone for JsonbAccessor<M, F> {
+                fn clone(&self) -> Self {
+                    Self { pool: self.pool.clone(), field: std::marker::PhantomData }
+                }
+            }
+
+            impl<M, F: JsonbField<M>> JsonbAccessor<M, F> {
+                pub fn new(pool: ConnectionPool) -> Self {
+                    Self { pool, field: std::marker::PhantomData }
+                }
+
+                /// Reads just the JSONB column instead of the whole row.
+                /// A missing row and a NULL column both come back as None,
+                /// which callers resolve to the compiled-in defaults.
+                async fn fetch(&self, keys: &[&(dyn tokio_postgres::types::ToSql + Sync)])
+                    -> Result<Option<serde_json::Value>, BoxError>
+                {
+                    let client = self.pool.get().await
+                        .map_err(|e| format!("Failed to get database connection from pool: {}", e))?;
+                    debug::log_query(F::SELECT_ONE_SQL, keys.len());
+                    let row = client.query_opt(F::SELECT_ONE_SQL, keys).await?;
+                    Ok(row.and_then(|row| row.get::<_, Option<serde_json::Value>>(0)))
+                }
+
+                pub async fn get_all(&self, keys: &[&(dyn tokio_postgres::types::ToSql + Sync)])
+                    -> Result<serde_json::Value, BoxError>
+                {
+                    Ok(self.fetch(keys).await?.unwrap_or_else(|| F::defaults().clone()))
+                }
+
+                pub async fn get_all_as<T>(&self, keys: &[&(dyn tokio_postgres::types::ToSql + Sync)])
+                    -> Result<T, BoxError>
+                where
+                    T: serde::de::DeserializeOwned,
+                {
+                    Ok(serde_json::from_value(self.get_all(keys).await?)?)
+                }
+
+                pub async fn get(&self, keys: &[&(dyn tokio_postgres::types::ToSql + Sync)], key: &str)
+                    -> Result<String, BoxError>
+                {
+                    match self.fetch(keys).await? {
+                        Some(value) => value.get_string(key).or_else(|_| F::defaults().get_string(key)),
+                        None => F::defaults().get_string(key),
+                    }
+                }
+
+                pub async fn get_as<T>(&self, keys: &[&(dyn tokio_postgres::types::ToSql + Sync)], key: &str)
+                    -> Result<T, BoxError>
+                where
+                    T: serde::de::DeserializeOwned,
+                {
+                    match self.fetch(keys).await? {
+                        Some(value) => value.get_value(key).or_else(|_| F::defaults().get_value(key)),
+                        None => F::defaults().get_value(key),
+                    }
+                }
+
+                pub async fn get_or<T>(&self, keys: &[&(dyn tokio_postgres::types::ToSql + Sync)], key: &str, default: T)
+                    -> Result<T, BoxError>
+                where
+                    T: serde::de::DeserializeOwned,
+                {
+                    match self.get_as(keys, key).await {
+                        Ok(value) => Ok(value),
+                        Err(_) => Ok(default),
+                    }
+                }
+
+                pub async fn has(&self, keys: &[&(dyn tokio_postgres::types::ToSql + Sync)], key: &str)
+                    -> Result<bool, BoxError>
+                {
+                    match self.fetch(keys).await? {
+                        Some(value) => Ok(value.has_key(key) || F::defaults().has_key(key)),
+                        None => Ok(F::defaults().has_key(key)),
+                    }
+                }
+
+                pub async fn set<T>(&self, keys: &[&(dyn tokio_postgres::types::ToSql + Sync)], key: &str, value: T)
+                    -> Result<(), BoxError>
+                where
+                    T: serde::Serialize + Send + Sync,
+                {
+                    let value_json = serde_json::to_value(&value)
+                        .map_err(|e| format!("Failed to serialize value for key '{}': {}", key, e))?;
+
+                    let client = self.pool.get().await
+                        .map_err(|e| format!("Failed to get database connection from pool: {}", e))?;
+
+                    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = keys.to_vec();
+                    params.push(&key);
+                    params.push(&value_json);
+                    debug::log_query(F::SET_SQL, params.len());
+
+                    client.execute(F::SET_SQL, &params[..]).await.map_err(|e| {
+                        format!(
+                            "Database error setting key '{}': {} (SQL: {}, value: {:?})",
+                            key, e, F::SET_SQL, value_json
+                        )
+                    })?;
+                    Ok(())
+                }
+
+                pub async fn get_many(
+                    &self,
+                    keys: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+                    wanted: &[&str],
+                ) -> Result<std::collections::HashMap<String, serde_json::Value>, BoxError> {
+                    let stored = self.fetch(keys).await?;
+
+                    let mut out = std::collections::HashMap::new();
+                    for &key in wanted {
+                        if let Some(value) = stored.as_ref().and_then(|stored| stored.get(key)) {
+                            out.insert(key.to_string(), value.clone());
+                        } else if let Some(value) = F::defaults().get(key) {
+                            out.insert(key.to_string(), value.clone());
+                        }
+                    }
+                    Ok(out)
+                }
+
+                pub async fn get_many_as<T>(
+                    &self,
+                    keys: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+                    wanted: &[&str],
+                ) -> Result<std::collections::HashMap<String, T>, BoxError>
+                where
+                    T: serde::de::DeserializeOwned,
+                {
+                    let values = self.get_many(keys, wanted).await?;
+                    let mut out = std::collections::HashMap::new();
+                    for (key, value) in values {
+                        if let Ok(parsed) = serde_json::from_value::<T>(value) {
+                            out.insert(key, parsed);
+                        }
+                    }
+                    Ok(out)
+                }
+
+                pub async fn get_many_ids<K, T>(&self, ids: &[K], key: &str)
+                    -> Result<std::collections::HashMap<K, T>, BoxError>
+                where
+                    K: tokio_postgres::types::ToSql
+                        + for<'a> tokio_postgres::types::FromSql<'a>
+                        + std::hash::Hash
+                        + Eq
+                        + Sync,
+                    T: serde::de::DeserializeOwned,
+                {
+                    if ids.is_empty() {
+                        return Ok(std::collections::HashMap::new());
+                    }
+
+                    let client = self.pool.get().await
+                        .map_err(|e| format!("Failed to get database connection from pool: {}", e))?;
+
+                    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&ids];
+                    debug::log_query(F::SELECT_BY_IDS_SQL, params.len());
+                    let rows = client.query(F::SELECT_BY_IDS_SQL, &params[..]).await?;
+
+                    let mut out = std::collections::HashMap::new();
+                    for row in rows {
+                        let id: K = row.get(0);
+                        let stored: Option<serde_json::Value> = row.get(1);
+                        let value = stored
+                            .as_ref()
+                            .and_then(|stored| stored.get_value::<T>(key).ok())
+                            .or_else(|| F::defaults().get_value::<T>(key).ok());
+                        if let Some(value) = value {
+                            out.insert(id, value);
+                        }
+                    }
+                    Ok(out)
+                }
+            }
 
             pub struct DeleteCore {
                 table: &'static str,
