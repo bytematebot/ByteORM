@@ -2,10 +2,35 @@
 
 ---
 
-[![Crates.io](https://img.shields.io/badge/crates.io-0.2.2-orange)](https://crates.io/crates/byteorm)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 > ByteORM is a lightweight ORM for Rust that generates a fully typed client crate from a Prisma-like `.bo` schema. Define your schema, run `byteorm push`, and use a typed Rust client with query builders, CRUD operations, and connection pooling.
+
+## Installation
+
+ByteORM is installed from this repository, not from crates.io.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bytematebot/byteorm/main/install.sh | bash
+```
+
+```powershell
+irm https://raw.githubusercontent.com/bytematebot/byteorm/main/install.ps1 | iex
+```
+
+Both scripts run `cargo install --git`, so Rust and Cargo have to be present first. To skip the scripts:
+
+```bash
+cargo install --git https://github.com/bytematebot/byteorm --package byteorm --bin byteorm --force
+```
+
+Updating later is the same command, or simply:
+
+```bash
+byteorm self-update
+```
+
+> The `byteorm` package on crates.io holds old `0.1.x` builds that cannot generate a working client, and is not maintained. Install from git.
 
 ## Using ByteORM
 
@@ -41,7 +66,7 @@ crate_name = "byteorm-client"
 dependency_source = "vendored"
 ```
 
-ByteORM v0.1.x keeps `dependency_source = "vendored"` as the default. The generated client includes its matching `byteorm-macros` copy, so projects do not need separate crates.io packages yet.
+`dependency_source = "vendored"` is the default. The generated client carries its own copy of `byteorm-macros`, matched to the version of ByteORM that produced it, so there is nothing to install alongside it. Re-run `byteorm generate` after updating ByteORM to keep the two in step.
 
 ### 2. Define Your Schema
 
