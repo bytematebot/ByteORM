@@ -274,6 +274,26 @@ pub fn pk_args(
 /// Emits `where_*` methods that record predicates on a `__private::Filters`
 /// reached through `filters_expr` (e.g. `core.filters()`). The SQL itself is
 /// assembled by the shared runtime, not here.
+/// Columns that get `_gt` / `_lt` / `_gte` / `_lte` companions: everything
+/// Postgres orders naturally.
+pub fn supports_comparisons(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "TimestamptZ"
+            | "Timestamp"
+            | "Date"
+            | "Snowflake"
+            | "snowflake"
+            | "Int"
+            | "BigInt"
+            | "Serial"
+            | "Float"
+            | "Real"
+            | "String"
+            | "Text"
+    )
+}
+
 pub fn generate_filter_methods<'a>(
     model: &'a Model,
     filters_expr: &'a str,
@@ -333,7 +353,7 @@ pub fn generate_filter_methods<'a>(
             });
         }
 
-        if field.type_name == "TimestamptZ" {
+        if supports_comparisons(&field.type_name) {
             let comparisons = [
                 (format_ident!("where_{}_gt", snake), format_ident!("Gt")),
                 (format_ident!("where_{}_lt", snake), format_ident!("Lt")),

@@ -159,8 +159,17 @@ mod tests {
     fn both_builder_states_share_one_set_of_methods() {
         let code = generate_query_builder_struct(&model()).to_string();
 
-        // one impl block carries the conditions for both states
-        assert_eq!(code.matches("where_id").count(), 2); // where_id and where_id_in
+        // one impl block carries the conditions for both states: eq, in and
+        // the four comparisons an ordered column gets
+        assert_eq!(code.matches("pub fn where_id ").count(), 1);
+        for suffix in ["in", "gt", "lt", "gte", "lte"] {
+            assert_eq!(
+                code.matches(&format!("pub fn where_id_{} ", suffix))
+                    .count(),
+                1,
+                "where_id_{suffix} should be generated exactly once"
+            );
+        }
         assert!(code.contains("impl < S > __private :: Query < Post , S >"));
         assert!(code.contains("pub type PostWhereBuilder"));
         assert!(!code.contains("SELECT {} FROM {}"));
