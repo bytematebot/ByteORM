@@ -77,6 +77,10 @@ struct RunArgs {
     fixture_users: usize,
     #[arg(long, default_value_t = 20)]
     fixture_posts_per_user: usize,
+    /// Repeat the whole run this many times, rotating the ORM order, and
+    /// report the median. One run cannot separate two close ORMs.
+    #[arg(long, default_value_t = 1)]
+    repeat: usize,
     /// Run every ORM in its own process, so peak RSS is attributable.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     isolate: bool,
@@ -114,10 +118,7 @@ fn main() -> Result<()> {
             println!("client generated, database ready at {}", database_url());
             Ok(())
         }
-        Command::Run(args) => {
-            let report = block_on(run_runtime(&args))?;
-            emit(&report, args.out.as_deref())
-        }
+        Command::Run(args) => block_on(run_repeated(&args)),
         Command::Compile(args) => {
             let mut report = empty_report();
             report.compile = run_compile(args.cold)?;
@@ -227,29 +228,87 @@ async fn run_runtime(args: &RunArgs) -> Result<Report> {
     ensure_database().await?;
     let orms = selected_orms(args)?;
     let cfg = run_config(args)?;
+    run_pass(args, &cfg, &orms, 0).await
+}
+
+/// One full pass over the ORMs. `rotation` shifts the starting position so no
+/// ORM is always measured first.
+async fn run_pass(
+    args: &RunArgs,
+    cfg: &RunConfig,
+    orms: &[String],
+    rotation: usize,
+) -> Result<Report> {
+    // The database, the page cache and the CPU all speed up over the first
+    // seconds of a session. Without this, whichever ORM ran first measured up
+    // to 2.8x slower than the same ORM running last.
+    let warm = bench_raw::connect(cfg.database_url.clone(), cfg.pool_size).await?;
+    bench_core::workload::warm_database(warm, cfg).await?;
+
+    let ordered: Vec<String> = (0..orms.len())
+        .map(|i| orms[(i + rotation) % orms.len()].clone())
+        .collect();
 
     let mut results = Vec::new();
-    for orm in &orms {
+    for orm in &ordered {
         eprintln!("==> {orm}");
         let entry = registry::find(orm).expect("checked above");
         let result = match (&entry.kind, args.isolate) {
             // An external adapter always runs as its own process; that is the
             // only way it can be linked at all.
-            (registry::Kind::External { .. }, _) | (_, true) => run_isolated(orm, &cfg)?,
+            (registry::Kind::External { .. }, _) | (_, true) => run_isolated(orm, cfg)?,
             (registry::Kind::Linked(connect), false) => {
                 let adapter = connect(cfg.database_url.clone(), cfg.pool_size).await?;
-                bench_core::workload::run_orm(adapter, &cfg).await?
+                bench_core::workload::run_orm(adapter, cfg).await?
             }
         };
         results.push(result);
     }
 
     Ok(Report {
-        meta: meta(args, &cfg),
+        meta: meta(args, cfg),
         runtime: results,
         compile: BTreeMap::new(),
         loc: BTreeMap::new(),
     })
+}
+
+/// Run the whole benchmark `--repeat` times and emit the runs plus, when
+/// there is more than one, a median summary.
+async fn run_repeated(args: &RunArgs) -> Result<()> {
+    if args.repeat <= 1 {
+        let report = run_runtime(args).await?;
+        return emit(&report, args.out.as_deref());
+    }
+
+    ensure_database().await?;
+    let orms = selected_orms(args)?;
+    let cfg = run_config(args)?;
+
+    let mut reports = Vec::with_capacity(args.repeat);
+    for pass in 0..args.repeat {
+        eprintln!("=== pass {}/{}", pass + 1, args.repeat);
+        let report = run_pass(args, &cfg, &orms, pass).await?;
+        write_report(&report, &out_dir(args).join(format!("run{}", pass + 1)))?;
+        reports.push(report);
+    }
+
+    let summary = bench_core::report::summary::summarize(&reports);
+    let markdown = summary.to_markdown();
+    println!("{markdown}");
+
+    let dir = out_dir(args);
+    std::fs::write(dir.join("summary.md"), &markdown)?;
+    std::fs::write(dir.join("summary.json"), summary.to_json())?;
+    eprintln!("wrote {}/summary.md and summary.json", dir.display());
+    Ok(())
+}
+
+fn out_dir(args: &RunArgs) -> std::path::PathBuf {
+    match &args.out {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => paths::results_dir(),
+    }
 }
 
 /// Re-invoke this binary for a single ORM. Peak RSS is only meaningful when
@@ -405,10 +464,15 @@ fn emit(report: &Report, out: Option<&str>) -> Result<()> {
         Some(dir) => std::path::PathBuf::from(dir),
         None => paths::results_dir(),
     };
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("report.json"), report.to_json())?;
-    std::fs::write(dir.join("report.md"), &markdown)?;
+    write_report(report, &dir)?;
     eprintln!("wrote {}/report.json and report.md", dir.display());
+    Ok(())
+}
+
+fn write_report(report: &Report, dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("report.json"), report.to_json())?;
+    std::fs::write(dir.join("report.md"), report.to_markdown())?;
     Ok(())
 }
 

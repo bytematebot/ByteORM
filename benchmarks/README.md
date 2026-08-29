@@ -23,7 +23,11 @@ cargo run --release --bin bench -- all          # runtime + compile time + LOC
 ```
 
 Reports land in `results/report.md` and `results/report.json`, and are also
-printed to stdout.
+printed to stdout. With `--repeat N` each pass is written to `run<N>/` and the
+median across passes to `summary.md` / `summary.json`.
+
+A single pass cannot separate two close ORMs: run-to-run spread on this suite
+is 10-20%. Quote `summary.md` from a `--repeat 3` run, not a single pass.
 
 `prepare` starts `postgres:17-alpine` through `docker-compose.yml` on port
 `55432`, with `fsync=off` and the data directory in tmpfs - the goal is to
@@ -48,6 +52,7 @@ Useful `run` options:
 --orm byteorm,sqlx            # subset of ORMs (default: all)
 --scenario find_by_pk,count   # subset of scenarios (default: all)
 --iterations 2000             # measured iterations per scenario
+--repeat 3                    # passes, rotating ORM order; reports the median
 --warmup 200                  # discarded iterations before measuring
 --concurrency 16              # concurrent tasks issuing the workload
 --pool-size 20                # connection pool size (matches ByteORM's fixed 20)
@@ -94,6 +99,16 @@ quoting any result.
   adapter is built with that same size.
 * **Warmup is discarded.** Connections, prepared-statement caches and the
   query planner are warm before the first measured iteration.
+* **The database is warmed before each pass, and ORM order is rotated.**
+  Postgres, the page cache and the CPU all change speed over the first seconds
+  of a session: measured on this suite, the same ORM scored 40 882 ops/s
+  running first and 114 386 ops/s running last - a 2.8x artefact of queue
+  position alone. Every pass now starts with an unrecorded warm-up through the
+  raw driver, and `--repeat N` rotates which ORM goes first, reporting the
+  median of N passes.
+* **A lead smaller than the noise is reported as a tie.** The summary compares
+  each leader's margin against the run-to-run spread of the top two and says
+  so in words, rather than letting a 3% gap read as a win.
 * **Throughput comes from the wall clock** of the measured phase, not from
   `1/mean`, so `--concurrency` shows up honestly.
 * **One process per ORM** (`--isolate`, on by default). Peak RSS is then

@@ -38,7 +38,7 @@ impl RunConfig {
         }
     }
 
-    fn fixture_spec(&self) -> FixtureSpec {
+    pub(crate) fn fixture_spec(&self) -> FixtureSpec {
         FixtureSpec {
             users: self.fixture_users,
             posts_per_user: self.fixture_posts_per_user,
@@ -140,6 +140,33 @@ fn failed(scenario: Scenario, e: BenchError) -> ScenarioResult {
         stats: None,
         note: Some(note),
     }
+}
+
+/// Drive the workload without recording anything.
+///
+/// Postgres, the page cache and the CPU all speed up over the first seconds of
+/// a session, which showed up as a 2.8x advantage for whichever ORM ran last.
+/// Every measured run is now preceded by this, so the database is already warm
+/// when the first ORM is measured.
+pub async fn warm_database(adapter: Arc<dyn OrmAdapter>, cfg: &RunConfig) -> Result<()> {
+    let fixture = Arc::new(fixture::seed(&cfg.database_url, &cfg.fixture_spec()).await?);
+    let ctx = Arc::new(OpCtx {
+        fixture,
+        config: cfg.scenario_config.clone(),
+        seq: AtomicUsize::new(0),
+        run_tag: format!("warm-{}", cfg.run_tag),
+    });
+
+    for scenario in &cfg.scenarios {
+        for _ in 0..cfg.warmup {
+            // A failure here is not a benchmark result; the measured run will
+            // report it properly.
+            if run_op(*scenario, &adapter, &ctx).await.is_err() {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Convenience wrapper used by the runner when it drives several ORMs inside

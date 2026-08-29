@@ -245,3 +245,191 @@ fn fmt_opt_s(v: Option<f64>) -> String {
         None => "n/a".to_string(),
     }
 }
+
+/// Aggregate several runs of the same configuration.
+///
+/// One run of this suite carries a double-digit percentage of run-to-run
+/// spread, so a single run cannot separate two close ORMs. These helpers take
+/// the median across runs and refuse to call a lead a win when it is smaller
+/// than the observed noise.
+pub mod summary {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Serialize};
+
+    use super::Report;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SummaryRow {
+        pub orm: String,
+        pub median_ops_per_sec: f64,
+        /// Largest deviation from the median, as a fraction of it.
+        pub spread: f64,
+        /// Ratio to the fastest ORM in this scenario.
+        pub vs_best: f64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ScenarioSummary {
+        pub scenario: String,
+        pub rows: Vec<SummaryRow>,
+        /// Whether the leader's margin exceeds the noise of the top two.
+        pub decisive: bool,
+        pub verdict: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Summary {
+        pub runs: usize,
+        pub scenarios: Vec<ScenarioSummary>,
+    }
+
+    fn median(values: &mut [f64]) -> f64 {
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mid = values.len() / 2;
+        if values.len().is_multiple_of(2) {
+            (values[mid - 1] + values[mid]) / 2.0
+        } else {
+            values[mid]
+        }
+    }
+
+    fn spread(values: &[f64], median: f64) -> f64 {
+        if values.len() < 2 || median == 0.0 {
+            return 0.0;
+        }
+        values
+            .iter()
+            .map(|v| (v - median).abs() / median)
+            .fold(0.0, f64::max)
+    }
+
+    pub fn summarize(reports: &[Report]) -> Summary {
+        // scenario -> orm -> one throughput per run
+        let mut collected: Vec<(String, BTreeMap<String, Vec<f64>>)> = Vec::new();
+
+        for report in reports {
+            for orm in &report.runtime {
+                for scenario in &orm.scenarios {
+                    let Some(stats) = &scenario.stats else {
+                        continue;
+                    };
+                    let entry = match collected.iter_mut().find(|(k, _)| *k == scenario.scenario) {
+                        Some((_, map)) => map,
+                        None => {
+                            collected.push((scenario.scenario.clone(), BTreeMap::new()));
+                            &mut collected.last_mut().expect("just pushed").1
+                        }
+                    };
+                    entry
+                        .entry(orm.orm.clone())
+                        .or_default()
+                        .push(stats.ops_per_sec);
+                }
+            }
+        }
+
+        let scenarios = collected
+            .into_iter()
+            .map(|(scenario, per_orm)| {
+                let mut rows: Vec<SummaryRow> = per_orm
+                    .into_iter()
+                    .map(|(orm, mut values)| {
+                        let m = median(&mut values);
+                        SummaryRow {
+                            orm,
+                            median_ops_per_sec: m,
+                            spread: spread(&values, m),
+                            vs_best: 0.0,
+                        }
+                    })
+                    .collect();
+                rows.sort_by(|a, b| {
+                    b.median_ops_per_sec
+                        .partial_cmp(&a.median_ops_per_sec)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                let best = rows.first().map(|r| r.median_ops_per_sec).unwrap_or(0.0);
+                for row in &mut rows {
+                    row.vs_best = if best > 0.0 {
+                        row.median_ops_per_sec / best
+                    } else {
+                        0.0
+                    };
+                }
+
+                let (decisive, verdict) = match rows.as_slice() {
+                    [first, second, ..] => {
+                        let lead = first.median_ops_per_sec / second.median_ops_per_sec - 1.0;
+                        let noise = first.spread.max(second.spread);
+                        if lead > noise {
+                            (
+                                true,
+                                format!(
+                                    "{} leads {} by {:.0}%",
+                                    first.orm,
+                                    second.orm,
+                                    lead * 100.0
+                                ),
+                            )
+                        } else {
+                            (
+                                false,
+                                format!(
+                                    "tie: {} over {} by {:.0}%, inside the ±{:.0}% run-to-run noise",
+                                    first.orm,
+                                    second.orm,
+                                    lead * 100.0,
+                                    noise * 100.0
+                                ),
+                            )
+                        }
+                    }
+                    _ => (false, "only one ORM measured".to_string()),
+                };
+
+                ScenarioSummary {
+                    scenario,
+                    rows,
+                    decisive,
+                    verdict,
+                }
+            })
+            .collect();
+
+        Summary {
+            runs: reports.len(),
+            scenarios,
+        }
+    }
+
+    impl Summary {
+        pub fn to_markdown(&self) -> String {
+            let mut out = format!("# Median of {} runs\n\n", self.runs);
+            out.push_str(
+                "ORM order is rotated between runs and the database is warmed before each one, \
+                 so position in the queue cannot decide the ranking.\n\n",
+            );
+            for scenario in &self.scenarios {
+                out.push_str(&format!("## `{}`\n\n", scenario.scenario));
+                out.push_str("| ORM | median ops/s | spread | vs best |\n|---|---:|---:|---:|\n");
+                for row in &scenario.rows {
+                    out.push_str(&format!(
+                        "| {} | {:.0} | ±{:.0}% | {:.2}x |\n",
+                        row.orm,
+                        row.median_ops_per_sec,
+                        row.spread * 100.0,
+                        row.vs_best
+                    ));
+                }
+                out.push_str(&format!("\n{}\n\n", scenario.verdict));
+            }
+            out
+        }
+
+        pub fn to_json(&self) -> String {
+            serde_json::to_string_pretty(self).expect("summary serializes")
+        }
+    }
+}
