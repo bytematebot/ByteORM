@@ -27,8 +27,9 @@ pub fn generate_create_builder(model: &Model) -> TokenStream {
                     core: __private::CreateCore::new(
                         #table_name,
                         #select_columns,
-                        <#model_name as crate::ModelMeta>::REQUIRED_COLUMNS,
-                        <#model_name as crate::ModelMeta>::ENUM_CASTS,
+                        <#model_name as crate::ModelMeta>::COLUMNS,
+                        <#model_name as crate::ModelMeta>::COLUMN_CASTS,
+                        <#model_name as crate::ModelMeta>::REQUIRED_MASK,
                     ),
                     pool,
                     fut: None,
@@ -55,8 +56,9 @@ pub fn generate_create_builder(model: &Model) -> TokenStream {
                         __private::CreateCore::new(
                             #table_name,
                             #select_columns,
-                            <#model_name as crate::ModelMeta>::REQUIRED_COLUMNS,
-                            <#model_name as crate::ModelMeta>::ENUM_CASTS,
+                            <#model_name as crate::ModelMeta>::COLUMNS,
+                            <#model_name as crate::ModelMeta>::COLUMN_CASTS,
+                            <#model_name as crate::ModelMeta>::REQUIRED_MASK,
                         ),
                     );
                     me.fut = Some(Box::pin(core.execute(me.pool.clone())));

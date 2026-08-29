@@ -241,11 +241,16 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
         pub trait ModelMeta: FromRow + Sized {
             const TABLE: &'static str;
             const SELECT_COLUMNS: &'static str;
-            /// Columns whose values must be cast through text, with the enum
-            /// type to cast to.
-            const ENUM_CASTS: &'static [(&'static str, &'static str)];
-            /// Columns that an insert must provide.
-            const REQUIRED_COLUMNS: &'static [&'static str];
+            /// Every column, sorted, so a builder can address one by index
+            /// and emit them in a stable order without sorting at runtime.
+            const COLUMNS: &'static [&'static str];
+            /// Enum cast per column, parallel to `COLUMNS`.
+            const COLUMN_CASTS: &'static [Option<&'static str>];
+            /// Bit per column in `COLUMNS`: set where an insert must provide
+            /// a value.
+            const REQUIRED_MASK: u128;
+            /// Bit per column in `COLUMNS`: set for primary key columns.
+            const PK_MASK: u128;
             const PK_COLUMNS: &'static [&'static str];
         }
 
@@ -752,11 +757,13 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                             "div" => "/",
                             _ => continue,
                         };
+                        // The operand is an i64 from the builder API, never
+                        // caller text, and inlining it keeps the column's own
+                        // type from clashing with a bound i64.
                         clauses.push(format!(
-                            "{} = {} {} ${}",
-                            arithmetic.column, arithmetic.column, symbol, params.len() + 1
+                            "{} = {} {} {}",
+                            arithmetic.column, arithmetic.column, symbol, arithmetic.value
                         ));
-                        params.push(SqlArg::I64(arithmetic.value));
                     }
 
                     let mut sql = format!("UPDATE {} SET {}", self.table, clauses.join(", "));
@@ -776,12 +783,90 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                 }
             }
 
+            /// Column values addressed by their index in `ModelMeta::COLUMNS`,
+            /// which keeps insert building free of hashing and sorting.
+            pub struct ColumnValues {
+                columns: &'static [&'static str],
+                casts: &'static [Option<&'static str>],
+                values: Vec<Option<SqlArg>>,
+                present: u128,
+            }
+
+            impl ColumnValues {
+                pub fn new(
+                    columns: &'static [&'static str],
+                    casts: &'static [Option<&'static str>],
+                ) -> Self {
+                    let mut values = Vec::with_capacity(columns.len());
+                    values.resize_with(columns.len(), || None);
+                    Self { columns, casts, values, present: 0 }
+                }
+
+                pub fn set(&mut self, index: usize, value: SqlArg) {
+                    self.values[index] = Some(value);
+                    self.present |= 1u128 << index;
+                }
+
+                pub fn present(&self) -> u128 {
+                    self.present
+                }
+
+                pub fn is_empty(&self) -> bool {
+                    self.present == 0
+                }
+
+                pub fn contains(&self, index: usize) -> bool {
+                    self.present & (1u128 << index) != 0
+                }
+
+                pub fn column(&self, index: usize) -> &'static str {
+                    self.columns[index]
+                }
+
+                /// Names the first column required by `mask` but not set.
+                pub fn first_missing(&self, mask: u128) -> Option<&'static str> {
+                    let missing = mask & !self.present;
+                    if missing == 0 {
+                        return None;
+                    }
+                    Some(self.columns[missing.trailing_zeros() as usize])
+                }
+
+                /// Emits `$n` placeholders and moves the values into `params`,
+                /// walking the columns in their sorted order.
+                pub fn take_into(
+                    &mut self,
+                    params: &mut Vec<SqlArg>,
+                ) -> (Vec<&'static str>, Vec<String>) {
+                    let count = self.present.count_ones() as usize;
+                    let mut columns = Vec::with_capacity(count);
+                    let mut placeholders = Vec::with_capacity(count);
+
+                    for index in 0..self.columns.len() {
+                        let Some(value) = self.values[index].take() else {
+                            continue;
+                        };
+                        let placeholder = params.len() + 1;
+                        match self.casts[index] {
+                            Some(cast) => {
+                                placeholders.push(format!("${}::TEXT::{}", placeholder, cast))
+                            }
+                            None => placeholders.push(format!("${}", placeholder)),
+                        }
+                        columns.push(self.columns[index]);
+                        params.push(value);
+                    }
+
+                    self.present = 0;
+                    (columns, placeholders)
+                }
+            }
+
             pub struct CreateCore {
                 table: &'static str,
                 select_columns: &'static str,
-                required: &'static [&'static str],
-                casts: &'static [(&'static str, &'static str)],
-                values: std::collections::HashMap<&'static str, SqlArg>,
+                required_mask: u128,
+                values: ColumnValues,
                 filters: Filters,
             }
 
@@ -789,15 +874,15 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                 pub fn new(
                     table: &'static str,
                     select_columns: &'static str,
-                    required: &'static [&'static str],
-                    casts: &'static [(&'static str, &'static str)],
+                    columns: &'static [&'static str],
+                    casts: &'static [Option<&'static str>],
+                    required_mask: u128,
                 ) -> Self {
                     Self {
                         table,
                         select_columns,
-                        required,
-                        casts,
-                        values: std::collections::HashMap::new(),
+                        required_mask,
+                        values: ColumnValues::new(columns, casts),
                         filters: Filters::new(),
                     }
                 }
@@ -806,29 +891,20 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                     &mut self.filters
                 }
 
-                pub fn push_value(&mut self, column: &'static str, value: SqlArg) {
-                    self.values.insert(column, value);
+                pub fn push_value(&mut self, index: usize, value: SqlArg) {
+                    self.values.set(index, value);
                 }
 
                 /// Consumes the core into the pieces `upsert_many` needs.
-                pub fn into_parts(self) -> (std::collections::HashMap<&'static str, SqlArg>, Filters) {
+                pub fn into_parts(self) -> (ColumnValues, Filters) {
                     (self.values, self.filters)
                 }
 
-                pub fn cast_for(casts: &[(&'static str, &'static str)], column: &str) -> Option<&'static str> {
-                    casts
-                        .iter()
-                        .find(|(name, _)| *name == column)
-                        .map(|(_, cast)| *cast)
-                }
-
                 pub fn check_required(&self) -> Result<(), BoxError> {
-                    for column in self.required {
-                        if !self.values.contains_key(column) {
-                            return Err(format!("Missing required field: {}", column).into());
-                        }
+                    if let Some(column) = self.values.first_missing(self.required_mask) {
+                        return Err(format!("Missing required field: {}", column).into());
                     }
-                    if self.values.is_empty() && !self.required.is_empty() {
+                    if self.values.is_empty() && self.required_mask != 0 {
                         return Err("No fields to create".into());
                     }
                     Ok(())
@@ -837,19 +913,8 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                 pub fn build(&mut self) -> Result<(String, Vec<SqlArg>), BoxError> {
                     self.check_required()?;
 
-                    let mut columns: Vec<&'static str> = self.values.keys().copied().collect();
-                    columns.sort();
-
-                    let mut placeholders: Vec<String> = Vec::with_capacity(columns.len());
-                    let mut params: Vec<SqlArg> = Vec::with_capacity(columns.len());
-                    for column in &columns {
-                        let placeholder = params.len() + 1;
-                        match Self::cast_for(self.casts, column) {
-                            Some(cast) => placeholders.push(format!("${}::TEXT::{}", placeholder, cast)),
-                            None => placeholders.push(format!("${}", placeholder)),
-                        }
-                        params.push(self.values.remove(column).expect("column was just listed"));
-                    }
+                    let mut params: Vec<SqlArg> = vec![];
+                    let (columns, placeholders) = self.values.take_into(&mut params);
 
                     let sql = format!(
                         "INSERT INTO {} ({}) VALUES ({}) RETURNING {}",
@@ -890,7 +955,6 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                 }
             }
 
-            /// Multi-row `INSERT`, shared by every model's `create_many`.
             pub async fn insert_many(
                 pool: ConnectionPool,
                 table: &'static str,
@@ -961,10 +1025,12 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
             /// single multi-row statement possible.
             pub struct UpsertBatch {
                 table: &'static str,
-                casts: &'static [(&'static str, &'static str)],
                 conflict_columns: Vec<&'static str>,
-                insert_columns: Option<Vec<&'static str>>,
-                update_columns: Option<Vec<&'static str>>,
+                conflict_mask: u128,
+                insert_mask: Option<u128>,
+                update_mask: Option<u128>,
+                insert_columns: Vec<&'static str>,
+                update_columns: Vec<&'static str>,
                 tuples: Vec<String>,
                 params: Vec<SqlArg>,
             }
@@ -972,24 +1038,31 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
             impl UpsertBatch {
                 pub fn new(
                     table: &'static str,
-                    casts: &'static [(&'static str, &'static str)],
+                    columns: &'static [&'static str],
                     conflict_columns: Vec<&'static str>,
                 ) -> Result<Self, BoxError> {
                     if conflict_columns.is_empty() {
                         return Err("Conflict target cannot be empty".into());
                     }
                     let mut seen = std::collections::HashSet::new();
+                    let mut conflict_mask = 0u128;
                     for column in &conflict_columns {
                         if !seen.insert(*column) {
                             return Err(format!("Duplicate conflict column: {}", column).into());
                         }
+                        match columns.iter().position(|name| name == column) {
+                            Some(index) => conflict_mask |= 1u128 << index,
+                            None => return Err(format!("Unknown conflict column: {}", column).into()),
+                        }
                     }
                     Ok(Self {
                         table,
-                        casts,
                         conflict_columns,
-                        insert_columns: None,
-                        update_columns: None,
+                        conflict_mask,
+                        insert_mask: None,
+                        update_mask: None,
+                        insert_columns: vec![],
+                        update_columns: vec![],
                         tuples: vec![],
                         params: vec![],
                     })
@@ -1016,29 +1089,23 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                         return Err("No fields to upsert".into());
                     }
 
-                    let mut insert_columns: Vec<&'static str> = values.keys().copied().collect();
-                    insert_columns.sort();
-
-                    for conflict_column in &self.conflict_columns {
-                        if !values.contains_key(conflict_column) {
-                            return Err(format!(
-                                "Missing conflict field in create builder: {}",
-                                conflict_column
-                            )
-                            .into());
-                        }
+                    let present = values.present();
+                    if let Some(column) = values.first_missing(self.conflict_mask) {
+                        return Err(
+                            format!("Missing conflict field in create builder: {}", column).into()
+                        );
                     }
 
-                    match &self.insert_columns {
-                        Some(expected) if expected != &insert_columns => {
+                    match self.insert_mask {
+                        Some(expected) if expected != present => {
                             return Err("upsert_many requires the same create columns for every record".into());
                         }
                         Some(_) => {}
-                        None => self.insert_columns = Some(insert_columns.clone()),
+                        None => self.insert_mask = Some(present),
                     }
 
                     let mut seen = std::collections::HashSet::new();
-                    let mut update_columns: Vec<&'static str> = Vec::new();
+                    let mut update_mask = 0u128;
                     for assignment in assignments {
                         if !seen.insert(assignment.column) {
                             return Err(format!(
@@ -1047,60 +1114,67 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                             )
                             .into());
                         }
-                        if !insert_columns.contains(&assignment.column) {
-                            return Err(format!(
-                                "Update field '{}' must also be set in create builder",
-                                assignment.column
-                            )
-                            .into());
+                        match (0..u128::BITS as usize).find(|index| {
+                            present & (1u128 << index) != 0
+                                && values.column(*index) == assignment.column
+                        }) {
+                            Some(index) => update_mask |= 1u128 << index,
+                            None => {
+                                return Err(format!(
+                                    "Update field '{}' must also be set in create builder",
+                                    assignment.column
+                                )
+                                .into())
+                            }
                         }
-                        update_columns.push(assignment.column);
                     }
-                    update_columns.sort();
 
-                    match &self.update_columns {
-                        Some(expected) if expected != &update_columns => {
+                    match self.update_mask {
+                        Some(expected) if expected != update_mask => {
                             return Err("upsert_many requires the same update columns for every record".into());
                         }
                         Some(_) => {}
-                        None => self.update_columns = Some(update_columns),
+                        None => {
+                            self.update_mask = Some(update_mask);
+                            self.update_columns = (0..u128::BITS as usize)
+                                .filter(|index| update_mask & (1u128 << index) != 0)
+                                .map(|index| values.column(index))
+                                .collect();
+                        }
                     }
 
-                    let mut placeholders: Vec<String> = Vec::with_capacity(insert_columns.len());
-                    for column in &insert_columns {
-                        let placeholder = self.params.len() + 1;
-                        match CreateCore::cast_for(self.casts, column) {
-                            Some(cast) => placeholders.push(format!("${}::TEXT::{}", placeholder, cast)),
-                            None => placeholders.push(format!("${}", placeholder)),
-                        }
-                        self.params.push(values.remove(column).expect("column was just listed"));
+                    let (columns, placeholders) = values.take_into(&mut self.params);
+                    if self.insert_columns.is_empty() {
+                        self.insert_columns = columns;
                     }
                     self.tuples.push(format!("({})", placeholders.join(", ")));
                     Ok(())
                 }
 
                 pub async fn execute(self, pool: ConnectionPool) -> Result<u64, BoxError> {
-                    let insert_columns = self.insert_columns.ok_or("No fields to upsert")?;
-                    let update_columns = self.update_columns.unwrap_or_default();
+                    if self.insert_columns.is_empty() {
+                        return Err("No fields to upsert".into());
+                    }
                     let conflict_clause = self.conflict_columns.join(", ");
 
-                    let sql = if update_columns.is_empty() {
+                    let sql = if self.update_columns.is_empty() {
                         format!(
                             "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO NOTHING",
                             self.table,
-                            insert_columns.join(", "),
+                            self.insert_columns.join(", "),
                             self.tuples.join(", "),
                             conflict_clause
                         )
                     } else {
-                        let assignments: Vec<String> = update_columns
+                        let assignments: Vec<String> = self
+                            .update_columns
                             .iter()
                             .map(|column| format!("{} = EXCLUDED.{}", column, column))
                             .collect();
                         format!(
                             "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {}",
                             self.table,
-                            insert_columns.join(", "),
+                            self.insert_columns.join(", "),
                             self.tuples.join(", "),
                             conflict_clause,
                             assignments.join(", ")
@@ -1117,70 +1191,69 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
             pub struct UpsertCore {
                 table: &'static str,
                 select_columns: &'static str,
-                casts: &'static [(&'static str, &'static str)],
-                pk_columns: &'static [&'static str],
-                values: std::collections::HashMap<&'static str, SqlArg>,
-                arithmetic: std::collections::HashMap<&'static str, (&'static str, i64)>,
+                pk_mask: u128,
+                values: ColumnValues,
+                arithmetic: Vec<(usize, &'static str, i64)>,
             }
 
             impl UpsertCore {
                 pub fn new(
                     table: &'static str,
                     select_columns: &'static str,
-                    casts: &'static [(&'static str, &'static str)],
-                    pk_columns: &'static [&'static str],
+                    columns: &'static [&'static str],
+                    casts: &'static [Option<&'static str>],
+                    pk_mask: u128,
                 ) -> Self {
                     Self {
                         table,
                         select_columns,
-                        casts,
-                        pk_columns,
-                        values: std::collections::HashMap::new(),
-                        arithmetic: std::collections::HashMap::new(),
+                        pk_mask,
+                        values: ColumnValues::new(columns, casts),
+                        arithmetic: vec![],
                     }
                 }
 
-                pub fn push_value(&mut self, column: &'static str, value: SqlArg) {
-                    self.values.insert(column, value);
+                pub fn push_value(&mut self, index: usize, value: SqlArg) {
+                    self.values.set(index, value);
                 }
 
-                pub fn push_arithmetic(&mut self, column: &'static str, op: &'static str, value: i64, seed: SqlArg) {
-                    self.arithmetic.insert(column, (op, value));
-                    self.values.insert(column, seed);
+                /// The inserted row carries the operand; the operator is
+                /// applied to the existing row on conflict.
+                pub fn push_arithmetic(&mut self, index: usize, op: &'static str, value: i64, seed: SqlArg) {
+                    self.arithmetic.push((index, op, value));
+                    self.values.set(index, seed);
                 }
 
                 pub fn build(&mut self) -> Result<(String, Vec<SqlArg>), BoxError> {
-                    for pk in self.pk_columns {
-                        if !self.values.contains_key(pk) {
-                            return Err(format!("Missing primary key field: {}", pk).into());
-                        }
+                    if let Some(column) = self.values.first_missing(self.pk_mask) {
+                        return Err(format!("Missing primary key field: {}", column).into());
                     }
                     if self.values.is_empty() {
                         return Err("No fields to upsert".into());
                     }
 
-                    let mut columns: Vec<&'static str> = self.values.keys().copied().collect();
-                    columns.sort();
+                    let pk_columns: Vec<&'static str> = (0..u128::BITS as usize)
+                        .filter(|index| self.pk_mask & (1u128 << index) != 0)
+                        .map(|index| self.values.column(index))
+                        .collect();
 
-                    let mut placeholders: Vec<String> = Vec::with_capacity(columns.len());
-                    let mut params: Vec<SqlArg> = Vec::with_capacity(columns.len());
-                    for column in &columns {
-                        let placeholder = params.len() + 1;
-                        match CreateCore::cast_for(self.casts, column) {
-                            Some(cast) => placeholders.push(format!("${}::TEXT::{}", placeholder, cast)),
-                            None => placeholders.push(format!("${}", placeholder)),
-                        }
-                        params.push(self.values.remove(column).expect("column was just listed"));
-                    }
+                    let arithmetic: Vec<(&'static str, &'static str, i64)> = self
+                        .arithmetic
+                        .drain(..)
+                        .map(|(index, op, value)| (self.values.column(index), op, value))
+                        .collect();
+
+                    let mut params: Vec<SqlArg> = vec![];
+                    let (columns, placeholders) = self.values.take_into(&mut params);
 
                     let update_columns: Vec<&'static str> = columns
                         .iter()
                         .copied()
-                        .filter(|column| !self.pk_columns.contains(column))
+                        .filter(|column| !pk_columns.contains(column))
                         .collect();
 
-                    let conflict_clause = self.pk_columns.join(", ");
-                    let sql = if update_columns.is_empty() && self.arithmetic.is_empty() {
+                    let conflict_clause = pk_columns.join(", ");
+                    let sql = if update_columns.is_empty() && arithmetic.is_empty() {
                         format!(
                             "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO NOTHING RETURNING {}",
                             self.table,
@@ -1192,22 +1265,24 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                     } else {
                         let assignments: Vec<String> = update_columns
                             .iter()
-                            .map(|column| match self.arithmetic.get(column) {
-                                Some((op, value)) => {
-                                    let symbol = match *op {
-                                        "inc" => "+",
-                                        "dec" => "-",
-                                        "mul" => "*",
-                                        "div" => "/",
-                                        _ => return format!("{} = EXCLUDED.{}", column, column),
-                                    };
-                                    let value = if *op == "dec" { value.abs() } else { *value };
-                                    format!(
-                                        "{} = COALESCE({}.{}, 0) {} {}",
-                                        column, self.table, column, symbol, value
-                                    )
+                            .map(|column| {
+                                match arithmetic.iter().find(|(name, _, _)| name == column) {
+                                    Some((_, op, value)) => {
+                                        let symbol = match *op {
+                                            "inc" => "+",
+                                            "dec" => "-",
+                                            "mul" => "*",
+                                            "div" => "/",
+                                            _ => return format!("{} = EXCLUDED.{}", column, column),
+                                        };
+                                        let value = if *op == "dec" { value.abs() } else { *value };
+                                        format!(
+                                            "{} = COALESCE({}.{}, 0) {} {}",
+                                            column, self.table, column, symbol, value
+                                        )
+                                    }
+                                    None => format!("{} = EXCLUDED.{}", column, column),
                                 }
-                                None => format!("{} = EXCLUDED.{}", column, column),
                             })
                             .collect();
 
@@ -1430,11 +1505,14 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                     self
                 }
 
+                /// Takes boxed values as part of its public signature; they
+                /// ride along as the boxed SqlArg variant.
                 pub fn where_raw(
                     mut self,
                     clause: impl Into<String>,
-                    params: Vec<SqlArg>,
+                    params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
                 ) -> Self {
+                    let params = params.into_iter().map(SqlArg::Boxed).collect();
                     self.core.filters().push_raw(clause.into(), params);
                     self
                 }

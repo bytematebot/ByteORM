@@ -408,7 +408,7 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
 
                 let mut batch = __private::UpsertBatch::new(
                     #table_name,
-                    <#model_name as crate::ModelMeta>::ENUM_CASTS,
+                    <#model_name as crate::ModelMeta>::COLUMNS,
                     conflict(#conflict_selector::new()).columns(),
                 )?;
 

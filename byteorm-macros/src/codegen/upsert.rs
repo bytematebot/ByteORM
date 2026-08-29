@@ -1,6 +1,6 @@
 use crate::codegen::utils::{
-    generate_create_value_methods, generate_select_columns, is_numeric_type, rust_type_from_schema,
-    sql_arg_expr, to_snake_case,
+    column_index, generate_create_value_methods, generate_select_columns, is_numeric_type,
+    rust_type_from_schema, sql_arg_expr, to_snake_case,
 };
 use crate::types::*;
 use proc_macro2::TokenStream;
@@ -41,11 +41,12 @@ pub fn generate_upsert_builder(model: &Model) -> TokenStream {
             .any(|m| matches!(m, Modifier::Nullable));
         let field_type = rust_type_from_schema(&field.type_name, is_nullable);
         let field_col = to_snake_case(&field.name);
+        let index = column_index(model, &field_col);
         let arg = sql_arg_expr(&field.type_name, is_nullable, quote! { value });
 
         quote! {
             pub fn #method_name(mut self, value: #field_type) -> Self {
-                self.core.push_value(#field_col, #arg);
+                self.core.push_value(#index, #arg);
                 self
             }
         }
@@ -54,39 +55,46 @@ pub fn generate_upsert_builder(model: &Model) -> TokenStream {
     let set_methods = generate_create_value_methods(model, "core");
 
     // Arithmetic on conflict seeds the inserted row with the operand itself,
-    // then applies the operator to the existing row on update.
+    // then applies the operator to the existing row on update. The seed has to
+    // match the column's own type, not the i64 the API takes.
     let inc_methods = model
         .fields
         .iter()
         .filter(|f| is_numeric_type(&f.type_name))
         .map(|field| {
             let field_col = to_snake_case(&field.name);
+            let index = column_index(model, &field_col);
             let inc_method = format_ident!("inc_{}", field_col);
             let dec_method = format_ident!("dec_{}", field_col);
             let mul_method = format_ident!("mul_{}", field_col);
             let div_method = format_ident!("div_{}", field_col);
-            let (c1, c2, c3, c4) = (
-                field_col.clone(),
-                field_col.clone(),
-                field_col.clone(),
-                field_col.clone(),
-            );
+
+            let seed = |value: TokenStream| match field.type_name.as_str() {
+                "Int" | "Serial" => quote! { __private::SqlArg::I32((#value) as i32) },
+                "Float" => quote! { __private::SqlArg::F64((#value) as f64) },
+                "Real" => quote! { __private::SqlArg::F32((#value) as f32) },
+                _ => quote! { __private::SqlArg::I64(#value) },
+            };
+            let inc_seed = seed(quote! { amount });
+            let dec_seed = seed(quote! { -amount });
+            let mul_seed = seed(quote! { 0i64 });
+            let div_seed = seed(quote! { 0i64 });
 
             quote! {
                 pub fn #inc_method(mut self, amount: i64) -> Self {
-                    self.core.push_arithmetic(#c1, "inc", amount, __private::SqlArg::I64(amount));
+                    self.core.push_arithmetic(#index, "inc", amount, #inc_seed);
                     self
                 }
                 pub fn #dec_method(mut self, amount: i64) -> Self {
-                    self.core.push_arithmetic(#c2, "dec", amount, __private::SqlArg::I64(-amount));
+                    self.core.push_arithmetic(#index, "dec", amount, #dec_seed);
                     self
                 }
                 pub fn #mul_method(mut self, factor: i64) -> Self {
-                    self.core.push_arithmetic(#c3, "mul", factor, __private::SqlArg::I64(0));
+                    self.core.push_arithmetic(#index, "mul", factor, #mul_seed);
                     self
                 }
                 pub fn #div_method(mut self, divisor: i64) -> Self {
-                    self.core.push_arithmetic(#c4, "div", divisor, __private::SqlArg::I64(0));
+                    self.core.push_arithmetic(#index, "div", divisor, #div_seed);
                     self
                 }
             }
@@ -107,8 +115,9 @@ pub fn generate_upsert_builder(model: &Model) -> TokenStream {
                     core: __private::UpsertCore::new(
                         #table_name,
                         #select_columns,
-                        <#model_name as crate::ModelMeta>::ENUM_CASTS,
-                        <#model_name as crate::ModelMeta>::PK_COLUMNS,
+                        <#model_name as crate::ModelMeta>::COLUMNS,
+                        <#model_name as crate::ModelMeta>::COLUMN_CASTS,
+                        <#model_name as crate::ModelMeta>::PK_MASK,
                     ),
                     pool,
                     fut: None,
@@ -131,8 +140,9 @@ pub fn generate_upsert_builder(model: &Model) -> TokenStream {
                         __private::UpsertCore::new(
                             #table_name,
                             #select_columns,
-                            <#model_name as crate::ModelMeta>::ENUM_CASTS,
-                            <#model_name as crate::ModelMeta>::PK_COLUMNS,
+                            <#model_name as crate::ModelMeta>::COLUMNS,
+                            <#model_name as crate::ModelMeta>::COLUMN_CASTS,
+                            <#model_name as crate::ModelMeta>::PK_MASK,
                         ),
                     );
                     me.fut = Some(Box::pin(core.execute(me.pool.clone())));

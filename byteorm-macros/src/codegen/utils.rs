@@ -86,8 +86,7 @@ pub fn sql_arg_expr(type_name: &str, nullable: bool, value: TokenStream) -> Toke
         "Boolean" => quote! { __private::SqlArg::Bool(#value) },
         "Float" => quote! { __private::SqlArg::F64(#value) },
         "Real" => quote! { __private::SqlArg::F32(#value) },
-        // enums arrive as text and are cast in SQL
-        _ => quote! { __private::SqlArg::Text(#value) },
+        _ => quote! { __private::SqlArg::boxed(#value) },
     }
 }
 
@@ -130,15 +129,11 @@ pub fn generate_model_meta_impl(model: &Model) -> TokenStream {
     let table_name = model.name.to_lowercase();
     let select_columns = generate_select_columns(model);
 
-    let enum_casts: Vec<TokenStream> = model
+    let enum_casts: Vec<(String, String)> = model
         .fields
         .iter()
         .filter(|field| !is_builtin_type(&field.type_name))
-        .map(|field| {
-            let column = to_snake_case(&field.name);
-            let cast = field.type_name.to_lowercase();
-            quote! { (#column, #cast) }
-        })
+        .map(|field| (to_snake_case(&field.name), field.type_name.to_lowercase()))
         .collect();
 
     let required_columns: Vec<String> = model
@@ -167,15 +162,72 @@ pub fn generate_model_meta_impl(model: &Model) -> TokenStream {
         .map(|field| to_snake_case(&field.name))
         .collect();
 
+    let columns = sorted_columns(model);
+    assert!(
+        columns.len() <= 128,
+        "model {} has {} columns; the column masks hold at most 128",
+        model.name,
+        columns.len()
+    );
+
+    let column_casts: Vec<TokenStream> = columns
+        .iter()
+        .map(|column| {
+            match enum_casts
+                .iter()
+                .find(|(name, _)| name == column)
+                .map(|(_, cast)| cast)
+            {
+                Some(cast) => quote! { Some(#cast) },
+                None => quote! { None },
+            }
+        })
+        .collect();
+
+    let required_mask = column_mask(&columns, &required_columns);
+    let pk_mask = column_mask(&columns, &pk_columns);
+
     quote! {
         impl crate::ModelMeta for #model_name {
             const TABLE: &'static str = #table_name;
             const SELECT_COLUMNS: &'static str = #select_columns;
-            const ENUM_CASTS: &'static [(&'static str, &'static str)] = &[#(#enum_casts),*];
-            const REQUIRED_COLUMNS: &'static [&'static str] = &[#(#required_columns),*];
+            const COLUMNS: &'static [&'static str] = &[#(#columns),*];
+            const COLUMN_CASTS: &'static [Option<&'static str>] = &[#(#column_casts),*];
+            const REQUIRED_MASK: u128 = #required_mask;
+            const PK_MASK: u128 = #pk_mask;
             const PK_COLUMNS: &'static [&'static str] = &[#(#pk_columns),*];
         }
     }
+}
+
+/// Every column name, sorted. Builders address a column by its index here,
+/// and emitting them in this order keeps insert statements stable without
+/// sorting at runtime.
+pub fn sorted_columns(model: &Model) -> Vec<String> {
+    let mut columns: Vec<String> = model
+        .fields
+        .iter()
+        .map(|field| to_snake_case(&field.name))
+        .collect();
+    columns.sort();
+    columns
+}
+
+/// Index of a column in `sorted_columns`.
+pub fn column_index(model: &Model, column: &str) -> usize {
+    sorted_columns(model)
+        .iter()
+        .position(|name| name == column)
+        .unwrap_or_else(|| panic!("column {} is not part of model {}", column, model.name))
+}
+
+fn column_mask(columns: &[String], selected: &[String]) -> u128 {
+    selected.iter().fold(0u128, |mask, column| {
+        match columns.iter().position(|name| name == column) {
+            Some(index) => mask | (1u128 << index),
+            None => mask,
+        }
+    })
 }
 
 pub fn pk_args(
@@ -314,13 +366,13 @@ pub fn generate_create_value_methods<'a>(
 
     model.fields.iter().map(move |field| {
         let snake = to_snake_case(&field.name);
+        let index = column_index(model, &snake);
         let method_name = format_ident!("set_{}", snake);
         let is_nullable = field
             .modifiers
             .iter()
             .any(|m| matches!(m, Modifier::Nullable));
         let field_type = rust_type_from_schema(&field.type_name, is_nullable);
-        let field_col = snake.clone();
         let core = core.clone();
         let arg = sql_arg_expr(&field.type_name, is_nullable, quote! { value });
         let string_arg = sql_arg_expr(&field.type_name, is_nullable, quote! { value.into() });
@@ -328,21 +380,21 @@ pub fn generate_create_value_methods<'a>(
         if !is_builtin_type(&field.type_name) {
             quote! {
                 pub fn #method_name(mut self, value: #field_type) -> Self {
-                    self.#core.push_value(#field_col, __private::SqlArg::Text(value.to_string()));
+                    self.#core.push_value(#index, __private::SqlArg::Text(value.to_string()));
                     self
                 }
             }
         } else if matches!(field.type_name.as_str(), "String" | "Text") {
             quote! {
                 pub fn #method_name(mut self, value: impl Into<#field_type>) -> Self {
-                    self.#core.push_value(#field_col, #string_arg);
+                    self.#core.push_value(#index, #string_arg);
                     self
                 }
             }
         } else {
             quote! {
                 pub fn #method_name(mut self, value: #field_type) -> Self {
-                    self.#core.push_value(#field_col, #arg);
+                    self.#core.push_value(#index, #arg);
                     self
                 }
             }
