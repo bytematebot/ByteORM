@@ -192,6 +192,24 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
         quote! { #accessor_name: models::#model_name_snake::#accessor_struct::new(pool.clone()) }
     });
 
+    // ON CONFLICT targets are tuples of columns; 64 is far past any real
+    // composite key but costs nothing beyond this one generated block.
+    let tuple_conflict_impls: Vec<TokenStream> = (2..=64usize)
+        .map(|arity| {
+            let types = (0..arity).map(|_| quote! { ConflictField<M> });
+            let names: Vec<_> = (0..arity).map(|i| format_ident!("f{}", i)).collect();
+            quote! {
+                impl<M> ConflictTarget<M> for (#(#types),*) {
+                    fn columns(self) -> Vec<&'static str> {
+                        let (#(#names),*) = self;
+                        vec![#(#names.name()),*]
+                    }
+                }
+            }
+        })
+        .collect();
+    let tuple_conflict_impls = quote! { #(#tuple_conflict_impls)* };
+
     let jsonb_ext = generate_jsonb_ext();
 
     let lib_code = quote! {
@@ -1415,6 +1433,44 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                     }
                 }
             }
+
+            /// A column usable as an `ON CONFLICT` target.
+            pub struct ConflictField<M> {
+                name: &'static str,
+                model: std::marker::PhantomData<fn() -> M>,
+            }
+
+            impl<M> Clone for ConflictField<M> {
+                fn clone(&self) -> Self {
+                    *self
+                }
+            }
+
+            impl<M> Copy for ConflictField<M> {}
+
+            impl<M> ConflictField<M> {
+                pub fn new(name: &'static str) -> Self {
+                    Self { name, model: std::marker::PhantomData }
+                }
+
+                pub fn name(self) -> &'static str {
+                    self.name
+                }
+            }
+
+            /// One column or a tuple of them. Implemented here for every
+            /// arity once, instead of per model.
+            pub trait ConflictTarget<M> {
+                fn columns(self) -> Vec<&'static str>;
+            }
+
+            impl<M> ConflictTarget<M> for ConflictField<M> {
+                fn columns(self) -> Vec<&'static str> {
+                    vec![self.name()]
+                }
+            }
+
+            #tuple_conflict_impls
 
             pub struct DeleteCore {
                 table: &'static str,

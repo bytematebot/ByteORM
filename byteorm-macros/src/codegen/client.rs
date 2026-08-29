@@ -176,21 +176,6 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
         quote! { #field_name: #conflict_field::new(#column_name) }
     });
 
-    let conflict_target_tuple_impls = (2..=model.fields.len()).map(|arity| {
-        let tuple_types = (0..arity).map(|_| quote! { #conflict_field });
-        let tuple_fields: Vec<_> = (0..arity).map(|i| format_ident!("f{}", i)).collect();
-        let tuple_values = tuple_fields.iter();
-
-        quote! {
-            impl #conflict_target for (#(#tuple_types),*) {
-                fn columns(self) -> Vec<&'static str> {
-                    let (#(#tuple_fields),*) = self;
-                    vec![#(#tuple_values.name()),*]
-                }
-            }
-        }
-    });
-
     let typed_agg_methods = {
         let field_methods = categories.numeric_fields.iter().map(|field| {
             let col_snake = to_snake_case(&field.name);
@@ -261,30 +246,12 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
         .collect();
 
     quote! {
-        #[derive(Clone, Copy)]
-        pub struct #conflict_field(&'static str);
+        pub type #conflict_field = __private::ConflictField<#model_name>;
 
-        impl #conflict_field {
-            pub fn new(name: &'static str) -> Self {
-                Self(name)
-            }
-
-            pub fn name(self) -> &'static str {
-                self.0
-            }
-        }
-
-        pub trait #conflict_target {
-            fn columns(self) -> Vec<&'static str>;
-        }
-
-        impl #conflict_target for #conflict_field {
-            fn columns(self) -> Vec<&'static str> {
-                vec![self.name()]
-            }
-        }
-
-        #(#conflict_target_tuple_impls)*
+        // Kept as a named trait so existing signatures still compile; every
+        // arity is implemented once in the shared runtime.
+        pub trait #conflict_target: __private::ConflictTarget<#model_name> {}
+        impl<T: __private::ConflictTarget<#model_name>> #conflict_target for T {}
 
         #[derive(Clone, Copy)]
         pub struct #conflict_selector {
