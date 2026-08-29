@@ -67,7 +67,9 @@ crate_name = "byteorm-client"
 dependency_source = "vendored"
 ```
 
-`dependency_source = "vendored"` is the default. The generated client carries its own copy of `byteorm-macros`, matched to the version of ByteORM that produced it, so there is nothing to install alongside it. Re-run `byteorm generate` after updating ByteORM to keep the two in step.
+`dependency_source = "vendored"` is the default. The generated client carries its own copy of `byteorm-macros`, matched to the version of ByteORM that produced it, so there is nothing to install alongside it.
+
+The generated `Cargo.toml` records which ByteORM produced it. When you upgrade, the next `byteorm generate` or `byteorm push` sees the mismatch and rewrites the whole client, even if your schema has not changed — the runtime, the vendored macros and the CLI always come from one version. Otherwise only files whose content actually changed are written, so Cargo does not rebuild the client for nothing. Force a full rewrite at any time with `byteorm generate --force`.
 
 ### 2. Define Your Schema
 
@@ -117,6 +119,8 @@ If a migration would drop tables, columns, or enum types, ByteORM stops unless y
 ```bash
 byteorm push --accept-data-loss
 ```
+
+Both commands take `--force` to rewrite every generated file regardless of whether its content changed.
 
 Inspect resolved paths and config:
 
