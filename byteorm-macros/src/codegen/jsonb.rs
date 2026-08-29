@@ -181,7 +181,7 @@ pub fn generate_jsonb_sub_accessors(model: &Model) -> Vec<TokenStream> {
                 impl std::fmt::Debug for #accessor_struct {
                     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                         f.debug_struct(stringify!(#accessor_struct))
-                            .field("pool", &"<bb8::Pool>")
+                            .field("pool", &"<ConnectionPool>")
                             .finish()
                     }
                 }

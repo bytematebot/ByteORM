@@ -424,7 +424,7 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
             #find_unique
             #find_or_create
 
-            pub async fn get_client(&self) -> Result<PooledClient<'_>, tokio_postgres::Error> {
+            pub async fn get_client(&self) -> Result<PooledClient, tokio_postgres::Error> {
                 self.pool.get().await
             }
 

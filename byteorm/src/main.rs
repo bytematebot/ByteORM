@@ -1495,8 +1495,7 @@ bytes = "1"
 tokio-postgres-rustls = "0.13"
 rustls = {{ version = "0.23", default-features = false, features = ["ring", "std"] }}
 webpki-roots = "0.26"
-bb8 = "0.8"
-bb8-postgres = "0.8"
+deadpool-postgres = "0.14"
 once_cell = "1.21.3"
 futures-util = "0.3.31"
 "#,

@@ -2054,24 +2054,24 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
 
         #jsonb_ext
 
-        /// Enum to support both TLS and NoTLS connection pools
+        /// The connection pool.
+        ///
+        /// `deadpool` hands out owned connections, each carrying its own
+        /// prepared-statement cache, so a repeated query costs one round trip
+        /// instead of prepare-then-execute. `Pinned` is a single connection
+        /// borrowed from that pool for the lifetime of a transaction.
         #[derive(Clone)]
         pub enum ConnectionPool {
-            Tls(Arc<bb8::Pool<bb8_postgres::PostgresConnectionManager<tokio_postgres_rustls::MakeRustlsConnect>>>),
-            NoTls(Arc<bb8::Pool<bb8_postgres::PostgresConnectionManager<tokio_postgres::NoTls>>>),
-            Pinned(Arc<tokio_postgres::Client>),
+            Pooled(deadpool_postgres::Pool),
+            Pinned(Arc<deadpool_postgres::Client>),
         }
 
         impl ConnectionPool {
-            pub async fn get(&self) -> Result<PooledClient<'_>, tokio_postgres::Error> {
+            pub async fn get(&self) -> Result<PooledClient, tokio_postgres::Error> {
                 match self {
-                    ConnectionPool::Tls(pool) => {
+                    ConnectionPool::Pooled(pool) => {
                         let conn = pool.get().await.map_err(|_| tokio_postgres::Error::__private_api_timeout())?;
-                        Ok(PooledClient::Tls(conn))
-                    }
-                    ConnectionPool::NoTls(pool) => {
-                        let conn = pool.get().await.map_err(|_| tokio_postgres::Error::__private_api_timeout())?;
-                        Ok(PooledClient::NoTls(conn))
+                        Ok(PooledClient::Pooled(conn))
                     }
                     ConnectionPool::Pinned(client) => {
                         Ok(PooledClient::Pinned(client.clone()))
@@ -2080,51 +2080,55 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
             }
         }
 
-        /// Wrapper for pooled connections that works with both TLS and NoTLS
-        pub enum PooledClient<'a> {
-            Tls(bb8::PooledConnection<'a, bb8_postgres::PostgresConnectionManager<tokio_postgres_rustls::MakeRustlsConnect>>),
-            NoTls(bb8::PooledConnection<'a, bb8_postgres::PostgresConnectionManager<tokio_postgres::NoTls>>),
-            Pinned(Arc<tokio_postgres::Client>),
+        /// A connection checked out of the pool, or the one connection a
+        /// transaction is pinned to.
+        pub enum PooledClient {
+            Pooled(deadpool_postgres::Client),
+            Pinned(Arc<deadpool_postgres::Client>),
         }
 
-        impl<'a> PooledClient<'a> {
-            pub async fn query(&self, sql: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+        impl PooledClient {
+            fn client(&self) -> &deadpool_postgres::Client {
                 match self {
-                    PooledClient::Tls(c) => c.query(sql, params).await,
-                    PooledClient::NoTls(c) => c.query(sql, params).await,
-                    PooledClient::Pinned(c) => c.query(sql, params).await,
+                    PooledClient::Pooled(c) => c,
+                    PooledClient::Pinned(c) => c,
                 }
+            }
+
+            pub async fn query(&self, sql: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+                let client = self.client();
+                let statement = client.prepare_cached(sql).await?;
+                client.query(&statement, params).await
             }
 
             pub async fn query_one(&self, sql: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<tokio_postgres::Row, tokio_postgres::Error> {
-                match self {
-                    PooledClient::Tls(c) => c.query_one(sql, params).await,
-                    PooledClient::NoTls(c) => c.query_one(sql, params).await,
-                    PooledClient::Pinned(c) => c.query_one(sql, params).await,
-                }
+                let client = self.client();
+                let statement = client.prepare_cached(sql).await?;
+                client.query_one(&statement, params).await
             }
 
             pub async fn query_opt(&self, sql: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<Option<tokio_postgres::Row>, tokio_postgres::Error> {
-                match self {
-                    PooledClient::Tls(c) => c.query_opt(sql, params).await,
-                    PooledClient::NoTls(c) => c.query_opt(sql, params).await,
-                    PooledClient::Pinned(c) => c.query_opt(sql, params).await,
-                }
+                let client = self.client();
+                let statement = client.prepare_cached(sql).await?;
+                client.query_opt(&statement, params).await
             }
 
             pub async fn execute(&self, sql: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<u64, tokio_postgres::Error> {
-                match self {
-                    PooledClient::Tls(c) => c.execute(sql, params).await,
-                    PooledClient::NoTls(c) => c.execute(sql, params).await,
-                    PooledClient::Pinned(c) => c.execute(sql, params).await,
-                }
+                let client = self.client();
+                let statement = client.prepare_cached(sql).await?;
+                client.execute(&statement, params).await
+            }
+
+            /// Statements that cannot be prepared, such as `BEGIN` or a
+            /// multi-statement script.
+            pub async fn batch_execute(&self, sql: &str) -> Result<(), tokio_postgres::Error> {
+                self.client().batch_execute(sql).await
             }
         }
 
         #[derive(Clone)]
         pub struct Client {
             pool: ConnectionPool,
-            connection_string: Option<String>,
             #(#model_accessors),*
         }
         impl std::fmt::Debug for Client {
@@ -2140,16 +2144,20 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                 let is_local = connection_string.contains("localhost") || connection_string.contains("127.0.0.1");
                 let requires_ssl = connection_string.contains("sslmode=require") || connection_string.contains("sslmode=verify");
 
-                let pool = if is_local && !requires_ssl {
-                    let manager = bb8_postgres::PostgresConnectionManager::new_from_stringlike(
-                        connection_string,
+                let pg_config: tokio_postgres::Config = connection_string.parse()?;
+                // `Fast` recycling hands a connection back without a
+                // round-trip health check; the statement cache makes that
+                // check the dominant cost otherwise.
+                let manager_config = deadpool_postgres::ManagerConfig {
+                    recycling_method: deadpool_postgres::RecyclingMethod::Fast,
+                };
+
+                let manager = if is_local && !requires_ssl {
+                    deadpool_postgres::Manager::from_config(
+                        pg_config,
                         tokio_postgres::NoTls,
-                    )?;
-                    let pool = bb8::Pool::builder()
-                        .max_size(20)
-                        .build(manager)
-                        .await?;
-                    ConnectionPool::NoTls(Arc::new(pool))
+                        manager_config,
+                    )
                 } else {
                     let root_store = rustls::RootCertStore {
                         roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
@@ -2158,20 +2166,17 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                         .with_root_certificates(root_store)
                         .with_no_client_auth();
                     let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
-                    let manager = bb8_postgres::PostgresConnectionManager::new_from_stringlike(
-                        connection_string,
-                        tls,
-                    )?;
-                    let pool = bb8::Pool::builder()
-                        .max_size(20)
-                        .build(manager)
-                        .await?;
-                    ConnectionPool::Tls(Arc::new(pool))
+                    deadpool_postgres::Manager::from_config(pg_config, tls, manager_config)
                 };
+
+                let pool = deadpool_postgres::Pool::builder(manager)
+                    .max_size(20)
+                    .build()
+                    .map_err(|_| tokio_postgres::Error::__private_api_timeout())?;
+                let pool = ConnectionPool::Pooled(pool);
 
                 Ok(Self {
                     pool: pool.clone(),
-                    connection_string: Some(connection_string.to_string()),
                     #(#accessor_inits),*
                 })
             }
@@ -2179,12 +2184,11 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
             pub fn from_pool(pool: ConnectionPool) -> Self {
                 Self {
                     pool: pool.clone(),
-                    connection_string: None,
                     #(#accessor_inits_clone),*
                 }
             }
 
-            pub async fn get_client(&self) -> Result<PooledClient<'_>, Error> {
+            pub async fn get_client(&self) -> Result<PooledClient, Error> {
                 self.pool.get().await
             }
 
@@ -2196,60 +2200,37 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                 E: From<tokio_postgres::Error> + Send,
                 T: Send,
             {
-                let client = self.pool.get().await.map_err(|e| E::from(e))?;
-                match client {
-                    PooledClient::Tls(mut c) => {
+                match self.pool.get().await.map_err(|e| E::from(e))? {
+                    PooledClient::Pooled(mut c) => {
                         let tx = c.transaction().await?;
-                        let transaction = Transaction { inner: tx };
-                        let result = f(transaction).await;
-                        result
+                        f(Transaction { inner: tx }).await
                     }
-                    PooledClient::NoTls(mut c) => {
-                        let tx = c.transaction().await?;
-                        let transaction = Transaction { inner: tx };
-                        let result = f(transaction).await;
-                        result
-                    }
+                    // A pinned connection is already inside a transaction; a
+                    // nested one would silently share it.
                     PooledClient::Pinned(_) => {
                         Err(E::from(tokio_postgres::Error::__private_api_timeout()))
                     }
                 }
             }
 
+            /// Begin a transaction on a connection taken from the pool. The
+            /// returned handle is a full client, so the generated model
+            /// builders run inside the transaction.
             pub async fn begin(&self) -> Result<TxClient, Error> {
-                let conn_str = self.connection_string.as_deref()
-                    .ok_or_else(|| tokio_postgres::Error::__private_api_timeout())?;
-                let is_local = conn_str.contains("localhost") || conn_str.contains("127.0.0.1");
-                let requires_ssl = conn_str.contains("sslmode=require") || conn_str.contains("sslmode=verify");
-                let client = if is_local && !requires_ssl {
-                    let (client, connection) = tokio_postgres::connect(conn_str, tokio_postgres::NoTls).await?;
-                    tokio::spawn(async move {
-                        if let Err(e) = connection.await {
-                            eprintln!("Transaction connection error: {}", e);
-                        }
-                    });
-                    client
-                } else {
-                    let root_store = rustls::RootCertStore {
-                        roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
-                    };
-                    let tls_config = rustls::ClientConfig::builder()
-                        .with_root_certificates(root_store)
-                        .with_no_client_auth();
-                    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
-                    let (client, connection) = tokio_postgres::connect(conn_str, tls).await?;
-                    tokio::spawn(async move {
-                        if let Err(e) = connection.await {
-                            eprintln!("Transaction connection error: {}", e);
-                        }
-                    });
-                    client
+                let client = match &self.pool {
+                    ConnectionPool::Pooled(pool) => pool
+                        .get()
+                        .await
+                        .map_err(|_| tokio_postgres::Error::__private_api_timeout())?,
+                    ConnectionPool::Pinned(_) => {
+                        return Err(tokio_postgres::Error::__private_api_timeout());
+                    }
                 };
-                client.execute("BEGIN", &[]).await?;
+                client.batch_execute("BEGIN").await?;
+
                 let pinned = Arc::new(client);
-                let pool = ConnectionPool::Pinned(pinned.clone());
-                let inner = Self::from_pool(pool);
-                Ok(TxClient { inner, pinned })
+                let inner = Self::from_pool(ConnectionPool::Pinned(pinned.clone()));
+                Ok(TxClient { inner, pinned: Some(pinned), settled: false })
             }
 
             pub async fn execute_raw(&self, sql: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<u64, Error> {
@@ -2263,20 +2244,48 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
             }
         }
 
+        /// A client pinned to one pooled connection with an open
+        /// transaction. Dropping it without `commit` or `rollback` sends a
+        /// rollback in the background, so the connection never returns to the
+        /// pool mid-transaction.
         pub struct TxClient {
             pub inner: Client,
-            pinned: Arc<tokio_postgres::Client>,
+            pinned: Option<Arc<deadpool_postgres::Client>>,
+            settled: bool,
         }
 
         impl TxClient {
-            pub async fn commit(self) -> Result<(), Error> {
-                self.pinned.execute("COMMIT", &[]).await?;
+            pub async fn commit(mut self) -> Result<(), Error> {
+                self.settled = true;
+                let pinned = self.pinned.take().expect("transaction handle is live");
+                pinned.batch_execute("COMMIT").await?;
                 Ok(())
             }
 
-            pub async fn rollback(self) -> Result<(), Error> {
-                self.pinned.execute("ROLLBACK", &[]).await?;
+            pub async fn rollback(mut self) -> Result<(), Error> {
+                self.settled = true;
+                let pinned = self.pinned.take().expect("transaction handle is live");
+                pinned.batch_execute("ROLLBACK").await?;
                 Ok(())
+            }
+        }
+
+        impl Drop for TxClient {
+            fn drop(&mut self) {
+                if self.settled {
+                    return;
+                }
+                if let Some(pinned) = self.pinned.take() {
+                    // Rolling back needs to await, which a `Drop` cannot; hand
+                    // it to the runtime instead. Outside a runtime there is
+                    // nothing to spawn onto, and dropping the connection
+                    // aborts the transaction anyway.
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            let _ = pinned.batch_execute("ROLLBACK").await;
+                        });
+                    }
+                }
             }
         }
 
@@ -2287,17 +2296,21 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
             }
         }
 
+        /// Raw SQL inside a transaction. Statements go through the pooled
+        /// connection's cache, like every other query.
         pub struct Transaction<'a> {
-            inner: tokio_postgres::Transaction<'a>,
+            inner: deadpool_postgres::Transaction<'a>,
         }
 
         impl<'a> Transaction<'a> {
             pub async fn execute(&self, sql: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<u64, Error> {
-                self.inner.execute(sql, params).await
+                let statement = self.inner.prepare_cached(sql).await?;
+                self.inner.execute(&statement, params).await
             }
 
             pub async fn query(&self, sql: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Result<Vec<tokio_postgres::Row>, Error> {
-                self.inner.query(sql, params).await
+                let statement = self.inner.prepare_cached(sql).await?;
+                self.inner.query(&statement, params).await
             }
 
             pub async fn commit(self) -> Result<(), Error> {
