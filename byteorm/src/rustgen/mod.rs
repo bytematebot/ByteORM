@@ -2063,7 +2063,7 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
         }
 
         impl ConnectionPool {
-            pub async fn get(&self) -> Result<PooledClient, tokio_postgres::Error> {
+            pub async fn get(&self) -> Result<PooledClient<'_>, tokio_postgres::Error> {
                 match self {
                     ConnectionPool::Tls(pool) => {
                         let conn = pool.get().await.map_err(|_| tokio_postgres::Error::__private_api_timeout())?;
