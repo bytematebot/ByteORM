@@ -49,19 +49,19 @@ fn generate_computed_where_methods(model: &Model) -> Vec<TokenStream> {
                 pub fn #method_gt<V>(mut self, value: V) -> Self
                 where V: tokio_postgres::types::ToSql + Sync + Send + 'static
                 {
-                    self.core().filters().push(#expression, WhereOp::Gt, Box::new(value));
+                    self.core().filters().push(#expression, WhereOp::Gt, __private::SqlArg::boxed(value));
                     self
                 }
                 pub fn #method_lt<V>(mut self, value: V) -> Self
                 where V: tokio_postgres::types::ToSql + Sync + Send + 'static
                 {
-                    self.core().filters().push(#expression, WhereOp::Lt, Box::new(value));
+                    self.core().filters().push(#expression, WhereOp::Lt, __private::SqlArg::boxed(value));
                     self
                 }
                 pub fn #method_eq<V>(mut self, value: V) -> Self
                 where V: tokio_postgres::types::ToSql + Sync + Send + 'static
                 {
-                    self.core().filters().push(#expression, WhereOp::Eq, Box::new(value));
+                    self.core().filters().push(#expression, WhereOp::Eq, __private::SqlArg::boxed(value));
                     self
                 }
             }

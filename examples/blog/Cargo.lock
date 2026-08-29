@@ -112,6 +112,7 @@ dependencies = [
  "bb8",
  "bb8-postgres",
  "byteorm-macros",
+ "bytes",
  "chrono",
  "futures-util",
  "once_cell",

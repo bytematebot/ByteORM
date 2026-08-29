@@ -391,7 +391,141 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
         pub mod __private {
             use super::{ConnectionPool, FromRow, JsonbExt, ModelMeta, WhereOp, WherePredicate, debug, render_where_predicates};
 
-            pub type SqlArg = Box<dyn tokio_postgres::types::ToSql + Sync + Send>;
+            /// A bound parameter. Common column types are stored inline;
+            /// anything else (nullable columns, `where_raw`, enums the
+            /// generator does not recognise) falls back to a box.
+            #[derive(Debug)]
+            pub enum SqlArg {
+                I32(i32),
+                I64(i64),
+                F32(f32),
+                F64(f64),
+                Bool(bool),
+                Text(String),
+                Json(serde_json::Value),
+                Timestamp(chrono::DateTime<chrono::Utc>),
+                Date(chrono::NaiveDate),
+                Boxed(Box<dyn tokio_postgres::types::ToSql + Sync + Send>),
+            }
+
+            impl SqlArg {
+                pub fn boxed<T>(value: T) -> Self
+                where
+                    T: tokio_postgres::types::ToSql + Sync + Send + 'static,
+                {
+                    SqlArg::Boxed(Box::new(value))
+                }
+            }
+
+            impl tokio_postgres::types::ToSql for SqlArg {
+                fn to_sql(
+                    &self,
+                    ty: &tokio_postgres::types::Type,
+                    out: &mut bytes::BytesMut,
+                ) -> Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>>
+                {
+                    match self {
+                        SqlArg::I32(value) => value.to_sql(ty, out),
+                        SqlArg::I64(value) => value.to_sql(ty, out),
+                        SqlArg::F32(value) => value.to_sql(ty, out),
+                        SqlArg::F64(value) => value.to_sql(ty, out),
+                        SqlArg::Bool(value) => value.to_sql(ty, out),
+                        SqlArg::Text(value) => value.to_sql(ty, out),
+                        SqlArg::Json(value) => value.to_sql(ty, out),
+                        SqlArg::Timestamp(value) => value.to_sql(ty, out),
+                        SqlArg::Date(value) => value.to_sql(ty, out),
+                        SqlArg::Boxed(value) => value.to_sql_checked(ty, out),
+                    }
+                }
+
+                fn accepts(_ty: &tokio_postgres::types::Type) -> bool {
+                    // The variant decides; `to_sql_checked` does the real check.
+                    true
+                }
+
+                fn to_sql_checked(
+                    &self,
+                    ty: &tokio_postgres::types::Type,
+                    out: &mut bytes::BytesMut,
+                ) -> Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>>
+                {
+                    match self {
+                        SqlArg::I32(value) => value.to_sql_checked(ty, out),
+                        SqlArg::I64(value) => value.to_sql_checked(ty, out),
+                        SqlArg::F32(value) => value.to_sql_checked(ty, out),
+                        SqlArg::F64(value) => value.to_sql_checked(ty, out),
+                        SqlArg::Bool(value) => value.to_sql_checked(ty, out),
+                        SqlArg::Text(value) => value.to_sql_checked(ty, out),
+                        SqlArg::Json(value) => value.to_sql_checked(ty, out),
+                        SqlArg::Timestamp(value) => value.to_sql_checked(ty, out),
+                        SqlArg::Date(value) => value.to_sql_checked(ty, out),
+                        SqlArg::Boxed(value) => value.to_sql_checked(ty, out),
+                    }
+                }
+            }
+
+            impl From<i32> for SqlArg {
+                fn from(value: i32) -> Self {
+                    SqlArg::I32(value)
+                }
+            }
+
+            impl From<i64> for SqlArg {
+                fn from(value: i64) -> Self {
+                    SqlArg::I64(value)
+                }
+            }
+
+            impl From<f32> for SqlArg {
+                fn from(value: f32) -> Self {
+                    SqlArg::F32(value)
+                }
+            }
+
+            impl From<f64> for SqlArg {
+                fn from(value: f64) -> Self {
+                    SqlArg::F64(value)
+                }
+            }
+
+            impl From<bool> for SqlArg {
+                fn from(value: bool) -> Self {
+                    SqlArg::Bool(value)
+                }
+            }
+
+            impl From<String> for SqlArg {
+                fn from(value: String) -> Self {
+                    SqlArg::Text(value)
+                }
+            }
+
+            impl From<serde_json::Value> for SqlArg {
+                fn from(value: serde_json::Value) -> Self {
+                    SqlArg::Json(value)
+                }
+            }
+
+            impl From<chrono::DateTime<chrono::Utc>> for SqlArg {
+                fn from(value: chrono::DateTime<chrono::Utc>) -> Self {
+                    SqlArg::Timestamp(value)
+                }
+            }
+
+            impl From<chrono::NaiveDate> for SqlArg {
+                fn from(value: chrono::NaiveDate) -> Self {
+                    SqlArg::Date(value)
+                }
+            }
+
+            impl<T> From<Box<T>> for SqlArg
+            where
+                T: tokio_postgres::types::ToSql + Sync + Send + 'static,
+            {
+                fn from(value: Box<T>) -> Self {
+                    SqlArg::Boxed(value)
+                }
+            }
             pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
             /// One WHERE condition: either a structured predicate or a raw
@@ -518,7 +652,7 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
             pub fn as_sql_refs(params: &[SqlArg]) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> {
                 params
                     .iter()
-                    .map(|param| param.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+                    .map(|param| param as &(dyn tokio_postgres::types::ToSql + Sync))
                     .collect()
             }
 
@@ -622,7 +756,7 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                             "{} = {} {} ${}",
                             arithmetic.column, arithmetic.column, symbol, params.len() + 1
                         ));
-                        params.push(Box::new(arithmetic.value));
+                        params.push(SqlArg::I64(arithmetic.value));
                     }
 
                     let mut sql = format!("UPDATE {} SET {}", self.table, clauses.join(", "));
@@ -760,8 +894,23 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
             pub async fn insert_many(
                 pool: ConnectionPool,
                 table: &'static str,
-                records: Vec<std::collections::HashMap<&'static str, SqlArg>>,
+                records: Vec<std::collections::HashMap<
+                    &'static str,
+                    Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
+                >>,
             ) -> Result<u64, BoxError> {
+                // `create_many` takes boxed values as part of its public
+                // signature; they ride along as the boxed SqlArg variant.
+                let records: Vec<std::collections::HashMap<&'static str, SqlArg>> = records
+                    .into_iter()
+                    .map(|record| {
+                        record
+                            .into_iter()
+                            .map(|(column, value)| (column, SqlArg::Boxed(value)))
+                            .collect()
+                    })
+                    .collect();
+
                 if records.is_empty() {
                     return Ok(0);
                 }
@@ -1238,7 +1387,7 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                         field, placeholder
                     );
                     let (sql, mut params) = self.build_scalar(&expression);
-                    params.push(Box::new(0i64));
+                    params.push(SqlArg::I64(0));
                     debug::log_query(&sql, params.len());
                     let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
                     let refs = as_sql_refs(&params);

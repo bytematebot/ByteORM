@@ -68,6 +68,29 @@ pub fn is_builtin_type(ty: &str) -> bool {
     )
 }
 
+/// Wraps a value in the `SqlArg` variant matching the column's type, so
+/// ordinary columns skip the box. Nullable columns and unrecognised types
+/// keep the boxed fallback.
+pub fn sql_arg_expr(type_name: &str, nullable: bool, value: TokenStream) -> TokenStream {
+    if nullable {
+        return quote! { __private::SqlArg::boxed(#value) };
+    }
+
+    match type_name {
+        "BigInt" => quote! { __private::SqlArg::I64(#value) },
+        "Int" | "Serial" => quote! { __private::SqlArg::I32(#value) },
+        "String" | "Text" => quote! { __private::SqlArg::Text(#value) },
+        "JsonB" | "Jsonb" => quote! { __private::SqlArg::Json(#value) },
+        "TimestamptZ" | "Timestamp" => quote! { __private::SqlArg::Timestamp(#value) },
+        "Date" => quote! { __private::SqlArg::Date(#value) },
+        "Boolean" => quote! { __private::SqlArg::Bool(#value) },
+        "Float" => quote! { __private::SqlArg::F64(#value) },
+        "Real" => quote! { __private::SqlArg::F32(#value) },
+        // enums arrive as text and are cast in SQL
+        _ => quote! { __private::SqlArg::Text(#value) },
+    }
+}
+
 pub fn generate_select_columns(model: &Model) -> String {
     model
         .fields
@@ -218,11 +241,12 @@ pub fn generate_filter_methods<'a>(
         let field_type = rust_type_from_schema(&field.type_name, is_nullable);
         let field_col = snake.clone();
         let filters = filters.clone();
+        let arg = sql_arg_expr(&field.type_name, is_nullable, quote! { value });
 
         let mut methods = vec![
             quote! {
                 pub fn #method_name(mut self, value: #field_type) -> Self {
-                    self.#filters.push(#field_col, WhereOp::Eq, Box::new(value));
+                    self.#filters.push(#field_col, WhereOp::Eq, #arg);
                     self
                 }
             },
@@ -230,7 +254,7 @@ pub fn generate_filter_methods<'a>(
                 pub fn #method_in(mut self, values: Vec<#field_type>) -> Self {
                     let values: Vec<__private::SqlArg> = values
                         .into_iter()
-                        .map(|value| Box::new(value) as __private::SqlArg)
+                        .map(|value| #arg)
                         .collect();
                     self.#filters.push_in(#field_col, values);
                     self
@@ -268,9 +292,10 @@ pub fn generate_filter_methods<'a>(
                 let field_type = field_type.clone();
                 let field_col = field_col.clone();
                 let filters = filters.clone();
+                let arg = arg.clone();
                 quote! {
                     pub fn #method(mut self, value: #field_type) -> Self {
-                        self.#filters.push(#field_col, WhereOp::#op, Box::new(value));
+                        self.#filters.push(#field_col, WhereOp::#op, #arg);
                         self
                     }
                 }
@@ -297,25 +322,27 @@ pub fn generate_create_value_methods<'a>(
         let field_type = rust_type_from_schema(&field.type_name, is_nullable);
         let field_col = snake.clone();
         let core = core.clone();
+        let arg = sql_arg_expr(&field.type_name, is_nullable, quote! { value });
+        let string_arg = sql_arg_expr(&field.type_name, is_nullable, quote! { value.into() });
 
         if !is_builtin_type(&field.type_name) {
             quote! {
                 pub fn #method_name(mut self, value: #field_type) -> Self {
-                    self.#core.push_value(#field_col, Box::new(value.to_string()));
+                    self.#core.push_value(#field_col, __private::SqlArg::Text(value.to_string()));
                     self
                 }
             }
         } else if matches!(field.type_name.as_str(), "String" | "Text") {
             quote! {
                 pub fn #method_name(mut self, value: impl Into<#field_type>) -> Self {
-                    self.#core.push_value(#field_col, Box::new(value.into()));
+                    self.#core.push_value(#field_col, #string_arg);
                     self
                 }
             }
         } else {
             quote! {
                 pub fn #method_name(mut self, value: #field_type) -> Self {
-                    self.#core.push_value(#field_col, Box::new(value));
+                    self.#core.push_value(#field_col, #arg);
                     self
                 }
             }
@@ -341,26 +368,28 @@ pub fn generate_update_set_methods<'a>(
         let field_type = rust_type_from_schema(&field.type_name, is_nullable);
         let field_col = snake.clone();
         let core = core.clone();
+        let arg = sql_arg_expr(&field.type_name, is_nullable, quote! { value });
+        let string_arg = sql_arg_expr(&field.type_name, is_nullable, quote! { value.into() });
 
         if !is_builtin_type(&field.type_name) {
             let cast = field.type_name.to_lowercase();
             quote! {
                 pub fn #method_name(mut self, value: #field_type) -> Self {
-                    self.#core.push_set(#field_col, Some(#cast), Box::new(value.to_string()));
+                    self.#core.push_set(#field_col, Some(#cast), __private::SqlArg::Text(value.to_string()));
                     self
                 }
             }
         } else if matches!(field.type_name.as_str(), "String" | "Text") {
             quote! {
                 pub fn #method_name(mut self, value: impl Into<#field_type>) -> Self {
-                    self.#core.push_set(#field_col, None, Box::new(value.into()));
+                    self.#core.push_set(#field_col, None, #string_arg);
                     self
                 }
             }
         } else {
             quote! {
                 pub fn #method_name(mut self, value: #field_type) -> Self {
-                    self.#core.push_set(#field_col, None, Box::new(value));
+                    self.#core.push_set(#field_col, None, #arg);
                     self
                 }
             }

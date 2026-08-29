@@ -1,6 +1,6 @@
 use crate::codegen::utils::{
     generate_create_value_methods, generate_select_columns, is_numeric_type, rust_type_from_schema,
-    to_snake_case,
+    sql_arg_expr, to_snake_case,
 };
 use crate::types::*;
 use proc_macro2::TokenStream;
@@ -41,10 +41,11 @@ pub fn generate_upsert_builder(model: &Model) -> TokenStream {
             .any(|m| matches!(m, Modifier::Nullable));
         let field_type = rust_type_from_schema(&field.type_name, is_nullable);
         let field_col = to_snake_case(&field.name);
+        let arg = sql_arg_expr(&field.type_name, is_nullable, quote! { value });
 
         quote! {
             pub fn #method_name(mut self, value: #field_type) -> Self {
-                self.core.push_value(#field_col, Box::new(value));
+                self.core.push_value(#field_col, #arg);
                 self
             }
         }
@@ -73,19 +74,19 @@ pub fn generate_upsert_builder(model: &Model) -> TokenStream {
 
             quote! {
                 pub fn #inc_method(mut self, amount: i64) -> Self {
-                    self.core.push_arithmetic(#c1, "inc", amount, Box::new(amount));
+                    self.core.push_arithmetic(#c1, "inc", amount, __private::SqlArg::I64(amount));
                     self
                 }
                 pub fn #dec_method(mut self, amount: i64) -> Self {
-                    self.core.push_arithmetic(#c2, "dec", amount, Box::new(-amount));
+                    self.core.push_arithmetic(#c2, "dec", amount, __private::SqlArg::I64(-amount));
                     self
                 }
                 pub fn #mul_method(mut self, factor: i64) -> Self {
-                    self.core.push_arithmetic(#c3, "mul", factor, Box::new(0i64));
+                    self.core.push_arithmetic(#c3, "mul", factor, __private::SqlArg::I64(0));
                     self
                 }
                 pub fn #div_method(mut self, divisor: i64) -> Self {
-                    self.core.push_arithmetic(#c4, "div", divisor, Box::new(0i64));
+                    self.core.push_arithmetic(#c4, "div", divisor, __private::SqlArg::I64(0));
                     self
                 }
             }

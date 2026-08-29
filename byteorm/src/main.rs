@@ -1508,6 +1508,7 @@ serde_json = "1.0.145"
 chrono = {{ version = "0.4.42", features = ["serde"]}}
 tokio = {{ version = "1.48.0", features = ["full"]}}
 tokio-postgres = {{ version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"] }}
+bytes = "1"
 tokio-postgres-rustls = "0.13"
 rustls = {{ version = "0.23", default-features = false, features = ["ring", "std"] }}
 webpki-roots = "0.26"
