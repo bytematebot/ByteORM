@@ -1,0 +1,33 @@
+# Standalone workspace: Toasty's SQLite driver and SQLx's both link
+# `sqlite3`, and Cargo allows only one such package per dependency graph even
+# when neither optional feature is enabled. Toasty therefore builds on its own
+# and is driven through the harness's child-process protocol.
+[workspace]
+
+[package]
+name = "bench-toasty"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "bench-toasty"
+path = "src/main.rs"
+
+[lib]
+name = "bench_toasty"
+path = "src/lib.rs"
+
+[dependencies]
+bench-core = { path = "../bench-core" }
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1.48", features = ["full"] }
+toasty = { version = "0.10", features = ["postgresql", "jiff"] }
+
+[profile.release]
+debug = false
+lto = "thin"
+codegen-units = 1

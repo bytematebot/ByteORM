@@ -1,0 +1,18 @@
+# Mirrors sql/schema.sql. The benchmark applies that SQL directly instead of
+# running `byteorm push`, so every ORM meets identical tables; this file only
+# drives client generation.
+model Users {
+    id         Serial      PrimaryKey
+    email      String      Unique
+    username   String      NotNull
+    created_at TimestamptZ @default(now())
+}
+
+model Posts {
+    id         Serial      PrimaryKey
+    user_id    Int         NotNull ForeignKey(Users.id, onDelete: cascade)
+    title      String      NotNull
+    content    String      NotNull
+    views      Int         @default(0)
+    created_at TimestamptZ @default(now()) Index
+}

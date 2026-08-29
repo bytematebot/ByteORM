@@ -5,6 +5,7 @@ members = [
 ]
 exclude = [
     "examples/blog/generated",
+    "benchmarks",
 ]
 resolver = "3"
 

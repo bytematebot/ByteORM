@@ -1,0 +1,7 @@
+[schema]
+path = "schema.bo"
+
+[client]
+output = "generated"
+crate_name = "byteorm-client"
+dependency_source = "vendored"

@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+exclude = ["crates/bench-toasty"]
+members = [
+    "crates/bench-core",
+    "crates/bench-raw",
+    "crates/bench-byteorm",
+    "crates/bench-diesel",
+    "crates/bench-seaorm",
+    "crates/bench-sqlx",
+    "crates/bench-runner",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.48", features = ["full"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+bb8 = "0.9"
+bb8-postgres = "0.9"
+futures = "0.3"
+
+[profile.release]
+debug = false
+lto = "thin"
+codegen-units = 1
