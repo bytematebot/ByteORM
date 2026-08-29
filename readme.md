@@ -2,6 +2,7 @@
 
 ---
 
+[![CI](https://github.com/bytematebot/byteorm/actions/workflows/ci.yml/badge.svg)](https://github.com/bytematebot/byteorm/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 > ByteORM is a lightweight ORM for Rust that generates a fully typed client crate from a Prisma-like `.bo` schema. Define your schema, run `byteorm push`, and use a typed Rust client with query builders, CRUD operations, and connection pooling.

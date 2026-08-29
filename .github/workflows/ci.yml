@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "integrations/**"
+      - "assets/**"
+      - "**/*.md"
+  pull_request:
+    paths-ignore:
+      - "integrations/**"
+      - "assets/**"
+      - "**/*.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Format, lint and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        # Includes the API gating test, which generates a client and compiles
+        # snippets against it, so it needs a writable target directory.
+        run: cargo test --workspace
+
+      - name: Build the example client end to end
+        run: |
+          cargo build -p byteorm --bin byteorm
+          cd examples/blog
+          ../../target/debug/byteorm generate
+          cargo check
