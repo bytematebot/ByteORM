@@ -2,7 +2,7 @@
 
 ---
 
-[![Crates.io](https://img.shields.io/badge/crates.io-0.1.6-orange)](https://crates.io/crates/byteorm)
+[![Crates.io](https://img.shields.io/badge/crates.io-0.2.0-orange)](https://crates.io/crates/byteorm)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 > ByteORM is a lightweight ORM for Rust that generates a fully typed client crate from a Prisma-like `.bo` schema. Define your schema, run `byteorm push`, and use a typed Rust client with query builders, CRUD operations, and connection pooling.
