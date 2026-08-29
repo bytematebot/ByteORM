@@ -1462,34 +1462,54 @@ fn generate_client_package(
     }
 
     let cargo_toml = generate_client_cargo_toml(&project.crate_name);
-    fs::write(client_path.join("Cargo.toml"), cargo_toml)?;
-
-    let files = rustgen::generate_rust_code(schema);
-    for (rel_path, content) in files {
-        let full_path = client_path.join(rel_path);
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&full_path, content)?;
-
-        let _ = std::process::Command::new("rustfmt")
-            .arg(full_path)
-            .output();
+    let mut rewritten = 0;
+    let mut total = 1;
+    if write_if_changed(&client_path.join("Cargo.toml"), &cargo_toml)? {
+        rewritten += 1;
     }
 
-    println!("Client generated successfully.");
+    // The generated code is already formatted by prettyplease, so it is
+    // compared and written as-is. Shelling out to rustfmt per file would
+    // rewrite every file on every run and invalidate the build cache.
+    let files = rustgen::generate_rust_code(schema);
+    for (rel_path, content) in files {
+        total += 1;
+        if write_if_changed(&client_path.join(rel_path), &content)? {
+            rewritten += 1;
+        }
+    }
+
+    if rewritten == 0 {
+        println!("Client already up to date ({} files unchanged).", total);
+    } else {
+        println!(
+            "Client generated successfully ({} of {} files rewritten).",
+            rewritten, total
+        );
+    }
 
     Ok(())
+}
+
+/// Writes `content` only when it differs from what is on disk, so unchanged
+/// files keep their mtime and Cargo can treat the crate as fresh.
+fn write_if_changed(path: &Path, content: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    if let Ok(existing) = fs::read_to_string(path) {
+        if existing == content {
+            return Ok(false);
+        }
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, content)?;
+    Ok(true)
 }
 
 fn embed_byteorm_macros(client_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let macros_path = client_path.join("byteorm-macros");
     for (rel, content) in embedded_macros_files() {
-        let dest = macros_path.join(rel);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&dest, content)?;
+        write_if_changed(&macros_path.join(rel), content)?;
     }
     Ok(())
 }
