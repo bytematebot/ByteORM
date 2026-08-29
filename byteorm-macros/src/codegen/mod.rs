@@ -1,9 +1,6 @@
 pub mod client;
-pub mod create;
-pub mod delete;
 pub mod jsonb;
 pub mod model;
+pub mod mutation;
 pub mod query;
-pub mod update;
-pub mod upsert;
 pub mod utils;

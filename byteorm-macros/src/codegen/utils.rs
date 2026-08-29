@@ -362,7 +362,12 @@ pub fn generate_create_value_methods<'a>(
     model: &'a Model,
     target: &'a str,
 ) -> impl Iterator<Item = TokenStream> + 'a {
-    let core: TokenStream = target.parse().expect("target must be valid Rust");
+    let core: TokenStream = if target.is_empty() {
+        quote! {}
+    } else {
+        let path: TokenStream = target.parse().expect("target must be valid Rust");
+        quote! { #path. }
+    };
 
     model.fields.iter().map(move |field| {
         let snake = to_snake_case(&field.name);
@@ -380,21 +385,21 @@ pub fn generate_create_value_methods<'a>(
         if !is_builtin_type(&field.type_name) {
             quote! {
                 pub fn #method_name(mut self, value: #field_type) -> Self {
-                    self.#core.push_value(#index, __private::SqlArg::Text(value.to_string()));
+                    self.#core push_value(#index, __private::SqlArg::Text(value.to_string()));
                     self
                 }
             }
         } else if matches!(field.type_name.as_str(), "String" | "Text") {
             quote! {
                 pub fn #method_name(mut self, value: impl Into<#field_type>) -> Self {
-                    self.#core.push_value(#index, #string_arg);
+                    self.#core push_value(#index, #string_arg);
                     self
                 }
             }
         } else {
             quote! {
                 pub fn #method_name(mut self, value: #field_type) -> Self {
-                    self.#core.push_value(#index, #arg);
+                    self.#core push_value(#index, #arg);
                     self
                 }
             }

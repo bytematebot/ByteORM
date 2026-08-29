@@ -413,11 +413,9 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
                 )?;
 
                 for record in records {
-                    let create_core =
-                        create(#create_builder::new(self.pool.clone()), record.clone()).into_core();
-                    let update_core =
-                        update(#update_builder::new(self.pool.clone()), record).into_core();
-                    batch.push(create_core, update_core)?;
+                    let create_builder = create(#create_builder::new(self.pool.clone()), record.clone());
+                    let update_builder = update(#update_builder::new(self.pool.clone()), record);
+                    batch.push(create_builder, update_builder)?;
                 }
 
                 batch.execute(self.pool.clone()).await

@@ -661,128 +661,6 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                     .collect()
             }
 
-            /// A column assignment: the column, an optional enum cast, and
-            /// where its bound argument sits in `set_args`.
-            pub struct Assignment {
-                pub column: &'static str,
-                pub cast: Option<&'static str>,
-            }
-
-            /// An in-place arithmetic update such as `amount = amount + $1`.
-            pub struct Arithmetic {
-                pub column: &'static str,
-                pub op: &'static str,
-                pub value: i64,
-            }
-
-            pub struct UpdateCore {
-                table: &'static str,
-                select_columns: &'static str,
-                assignments: Vec<Assignment>,
-                set_args: Vec<SqlArg>,
-                arithmetic: Vec<Arithmetic>,
-                filters: Filters,
-                allow_all_rows: bool,
-            }
-
-            impl UpdateCore {
-                pub fn new(table: &'static str, select_columns: &'static str) -> Self {
-                    Self {
-                        table,
-                        select_columns,
-                        assignments: vec![],
-                        set_args: vec![],
-                        arithmetic: vec![],
-                        filters: Filters::new(),
-                        allow_all_rows: false,
-                    }
-                }
-
-                pub fn filters(&mut self) -> &mut Filters {
-                    &mut self.filters
-                }
-
-                pub fn push_set(&mut self, column: &'static str, cast: Option<&'static str>, value: SqlArg) {
-                    self.assignments.push(Assignment { column, cast });
-                    self.set_args.push(value);
-                }
-
-                pub fn push_arithmetic(&mut self, column: &'static str, op: &'static str, value: i64) {
-                    self.arithmetic.push(Arithmetic { column, op, value });
-                }
-
-                pub fn allow_all_rows(&mut self) {
-                    self.allow_all_rows = true;
-                }
-
-                pub fn has_changes(&self) -> bool {
-                    !self.assignments.is_empty() || !self.arithmetic.is_empty()
-                }
-
-                /// Consumes the core into the pieces `upsert_many` needs.
-                pub fn into_parts(self) -> (Vec<Assignment>, Vec<SqlArg>, Vec<Arithmetic>, Filters) {
-                    (self.assignments, self.set_args, self.arithmetic, self.filters)
-                }
-
-                pub fn build(&mut self) -> Result<(String, Vec<SqlArg>), BoxError> {
-                    if !self.has_changes() {
-                        return Err("No fields to update".into());
-                    }
-                    if self.filters.is_empty() && !self.allow_all_rows {
-                        return Err("UPDATE without WHERE clause is not allowed; call allow_all_rows() to update every row".into());
-                    }
-
-                    let mut clauses: Vec<String> = Vec::with_capacity(
-                        self.assignments.len() + self.arithmetic.len()
-                    );
-                    let mut params: Vec<SqlArg> = vec![];
-
-                    for (assignment, value) in self.assignments.drain(..).zip(self.set_args.drain(..)) {
-                        let placeholder = params.len() + 1;
-                        match assignment.cast {
-                            Some(cast) => clauses.push(format!(
-                                "{} = ${}::TEXT::{}",
-                                assignment.column, placeholder, cast
-                            )),
-                            None => clauses.push(format!("{} = ${}", assignment.column, placeholder)),
-                        }
-                        params.push(value);
-                    }
-
-                    for arithmetic in self.arithmetic.drain(..) {
-                        let symbol = match arithmetic.op {
-                            "inc" => "+",
-                            "dec" => "-",
-                            "mul" => "*",
-                            "div" => "/",
-                            _ => continue,
-                        };
-                        // The operand is an i64 from the builder API, never
-                        // caller text, and inlining it keeps the column's own
-                        // type from clashing with a bound i64.
-                        clauses.push(format!(
-                            "{} = {} {} {}",
-                            arithmetic.column, arithmetic.column, symbol, arithmetic.value
-                        ));
-                    }
-
-                    let mut sql = format!("UPDATE {} SET {}", self.table, clauses.join(", "));
-                    self.filters.append_to(&mut sql, &mut params);
-                    sql.push_str(&format!(" RETURNING {}", self.select_columns));
-                    Ok((sql, params))
-                }
-
-                pub async fn execute(mut self, pool: ConnectionPool)
-                    -> Result<Vec<tokio_postgres::Row>, BoxError>
-                {
-                    let (sql, params) = self.build()?;
-                    debug::log_query(&sql, params.len());
-                    let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
-                    let refs = as_sql_refs(&params);
-                    Ok(client.query(&sql, &refs[..]).await?)
-                }
-            }
-
             /// Column values addressed by their index in `ModelMeta::COLUMNS`,
             /// which keeps insert building free of hashing and sorting.
             pub struct ColumnValues {
@@ -805,6 +683,11 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                 pub fn set(&mut self, index: usize, value: SqlArg) {
                     self.values[index] = Some(value);
                     self.present |= 1u128 << index;
+                }
+
+                pub fn clear(&mut self, index: usize) {
+                    self.values[index] = None;
+                    self.present &= !(1u128 << index);
                 }
 
                 pub fn present(&self) -> u128 {
@@ -862,28 +745,60 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                 }
             }
 
-            pub struct CreateCore {
-                table: &'static str,
-                select_columns: &'static str,
-                required_mask: u128,
-                values: ColumnValues,
-                filters: Filters,
+            /// Which operation a mutation builder performs. The mode also
+            /// gates which methods the generated builder exposes.
+            pub struct CreateMode;
+            pub struct UpdateMode;
+            pub struct DeleteMode;
+            pub struct UpsertMode;
+
+            /// Modes that take a WHERE clause.
+            pub trait AcceptsFilters {}
+            impl AcceptsFilters for CreateMode {}
+            impl AcceptsFilters for UpdateMode {}
+            impl AcceptsFilters for DeleteMode {}
+
+            /// Modes that take column values.
+            pub trait AcceptsValues {}
+            impl AcceptsValues for CreateMode {}
+            impl AcceptsValues for UpdateMode {}
+            impl AcceptsValues for UpsertMode {}
+
+            /// Modes that take in-place arithmetic.
+            pub trait AcceptsArithmetic {}
+            impl AcceptsArithmetic for UpdateMode {}
+            impl AcceptsArithmetic for UpsertMode {}
+
+            pub enum MutationOutcome {
+                Rows(Vec<tokio_postgres::Row>),
+                Count(u64),
             }
 
-            impl CreateCore {
-                pub fn new(
-                    table: &'static str,
-                    select_columns: &'static str,
-                    columns: &'static [&'static str],
-                    casts: &'static [Option<&'static str>],
-                    required_mask: u128,
-                ) -> Self {
+            /// One builder behind `Create`, `Update`, `Delete` and `Upsert`.
+            /// The typed `where_*`, `set_*` and `inc_*` methods are generated
+            /// once per model and shared by every mode that accepts them.
+            pub struct Mutation<M: ModelMeta, Mode> {
+                values: ColumnValues,
+                filters: Filters,
+                arithmetic: Vec<(usize, &'static str, i64)>,
+                allow_all_rows: bool,
+                pool: ConnectionPool,
+                fut: Option<std::pin::Pin<Box<dyn std::future::Future<
+                    Output = Result<MutationOutcome, BoxError>
+                > + Send>>>,
+                mode: std::marker::PhantomData<fn() -> (M, Mode)>,
+            }
+
+            impl<M: ModelMeta, Mode> Mutation<M, Mode> {
+                pub fn new(pool: ConnectionPool) -> Self {
                     Self {
-                        table,
-                        select_columns,
-                        required_mask,
-                        values: ColumnValues::new(columns, casts),
+                        values: ColumnValues::new(M::COLUMNS, M::COLUMN_CASTS),
                         filters: Filters::new(),
+                        arithmetic: vec![],
+                        allow_all_rows: false,
+                        pool,
+                        fut: None,
+                        mode: std::marker::PhantomData,
                     }
                 }
 
@@ -895,50 +810,92 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                     self.values.set(index, value);
                 }
 
-                /// Consumes the core into the pieces `upsert_many` needs.
-                pub fn into_parts(self) -> (ColumnValues, Filters) {
-                    (self.values, self.filters)
+                /// The seed is what an insert writes; the operator is applied
+                /// to the existing row when the statement updates one.
+                pub fn push_arithmetic(&mut self, index: usize, op: &'static str, value: i64, seed: SqlArg) {
+                    self.arithmetic.push((index, op, value));
+                    self.values.set(index, seed);
                 }
 
-                pub fn check_required(&self) -> Result<(), BoxError> {
-                    if let Some(column) = self.values.first_missing(self.required_mask) {
+                /// Hands the collected state to `upsert_many`.
+                pub fn into_parts(self) -> (ColumnValues, Filters, Vec<(usize, &'static str, i64)>) {
+                    (self.values, self.filters, self.arithmetic)
+                }
+
+                fn take_state(&mut self) -> (ColumnValues, Filters, Vec<(usize, &'static str, i64)>) {
+                    (
+                        std::mem::replace(&mut self.values, ColumnValues::new(M::COLUMNS, M::COLUMN_CASTS)),
+                        std::mem::replace(&mut self.filters, Filters::new()),
+                        std::mem::take(&mut self.arithmetic),
+                    )
+                }
+
+                fn arithmetic_clauses(
+                    values: &ColumnValues,
+                    arithmetic: &[(usize, &'static str, i64)],
+                ) -> Vec<String> {
+                    arithmetic
+                        .iter()
+                        .filter_map(|(index, op, value)| {
+                            let column = values.column(*index);
+                            let symbol = match *op {
+                                "inc" => "+",
+                                "dec" => "-",
+                                "mul" => "*",
+                                "div" => "/",
+                                _ => return None,
+                            };
+                            // The operand is an i64 from the builder API, never
+                            // caller text, and inlining it keeps the column's
+                            // own type from clashing with a bound i64.
+                            Some(format!("{} = {} {} {}", column, column, symbol, value))
+                        })
+                        .collect()
+                }
+            }
+
+            impl<M: ModelMeta + 'static> Mutation<M, CreateMode> {
+                pub fn check_required(values: &ColumnValues) -> Result<(), BoxError> {
+                    if let Some(column) = values.first_missing(M::REQUIRED_MASK) {
                         return Err(format!("Missing required field: {}", column).into());
                     }
-                    if self.values.is_empty() && self.required_mask != 0 {
+                    if values.is_empty() && M::REQUIRED_MASK != 0 {
                         return Err("No fields to create".into());
                     }
                     Ok(())
                 }
 
-                pub fn build(&mut self) -> Result<(String, Vec<SqlArg>), BoxError> {
-                    self.check_required()?;
+                fn build(values: &mut ColumnValues) -> Result<(String, Vec<SqlArg>), BoxError> {
+                    Self::check_required(values)?;
 
                     let mut params: Vec<SqlArg> = vec![];
-                    let (columns, placeholders) = self.values.take_into(&mut params);
+                    let (columns, placeholders) = values.take_into(&mut params);
 
                     let sql = format!(
                         "INSERT INTO {} ({}) VALUES ({}) RETURNING {}",
-                        self.table,
+                        M::TABLE,
                         columns.join(", "),
                         placeholders.join(", "),
-                        self.select_columns
+                        M::SELECT_COLUMNS
                     );
                     Ok((sql, params))
                 }
 
                 /// Runs the pre-insert uniqueness check the builder's WHERE
                 /// clause asks for, then the insert itself.
-                pub async fn execute(mut self, pool: ConnectionPool)
-                    -> Result<tokio_postgres::Row, BoxError>
-                {
-                    self.check_required()?;
+                async fn run(
+                    pool: ConnectionPool,
+                    mut values: ColumnValues,
+                    mut filters: Filters,
+                ) -> Result<MutationOutcome, BoxError> {
+                    Self::check_required(&values)?;
 
                     let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
 
-                    if !self.filters.is_empty() {
-                        let mut sql = format!("SELECT COUNT(*) FROM {}", self.table);
+                    if !filters.is_empty() {
+                        let mut sql = format!("SELECT COUNT(*) FROM {}", M::TABLE);
                         let mut params: Vec<SqlArg> = vec![];
-                        self.filters.append_to(&mut sql, &mut params);
+                        filters.append_to(&mut sql, &mut params);
                         debug::log_query(&sql, params.len());
                         let refs = as_sql_refs(&params);
                         let row = client.query_one(&sql, &refs[..]).await?;
@@ -948,12 +905,309 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                         }
                     }
 
-                    let (sql, params) = self.build()?;
+                    let (sql, params) = Self::build(&mut values)?;
                     debug::log_query(&sql, params.len());
                     let refs = as_sql_refs(&params);
-                    Ok(client.query_one(&sql, &refs[..]).await?)
+                    Ok(MutationOutcome::Rows(vec![client.query_one(&sql, &refs[..]).await?]))
                 }
             }
+
+            impl<M: ModelMeta + 'static> Mutation<M, UpdateMode> {
+                /// Allows the update to run without a WHERE clause, changing
+                /// every row in the table.
+                pub fn allow_all_rows(mut self) -> Self {
+                    self.allow_all_rows = true;
+                    self
+                }
+
+                fn build(
+                    values: &mut ColumnValues,
+                    filters: &mut Filters,
+                    arithmetic: &[(usize, &'static str, i64)],
+                    allow_all_rows: bool,
+                ) -> Result<(String, Vec<SqlArg>), BoxError> {
+                    if values.is_empty() && arithmetic.is_empty() {
+                        return Err("No fields to update".into());
+                    }
+                    if filters.is_empty() && !allow_all_rows {
+                        return Err("UPDATE without WHERE clause is not allowed; call allow_all_rows() to update every row".into());
+                    }
+
+                    let arithmetic_clauses = Self::arithmetic_clauses(values, arithmetic);
+                    // Arithmetic columns carry a seed value for inserts; an
+                    // update expresses them as an expression instead.
+                    for (index, _, _) in arithmetic {
+                        values.clear(*index);
+                    }
+
+                    let mut params: Vec<SqlArg> = vec![];
+                    let (columns, placeholders) = values.take_into(&mut params);
+                    let mut clauses: Vec<String> = columns
+                        .iter()
+                        .zip(placeholders.iter())
+                        .map(|(column, placeholder)| format!("{} = {}", column, placeholder))
+                        .collect();
+                    clauses.extend(arithmetic_clauses);
+
+                    let mut sql = format!("UPDATE {} SET {}", M::TABLE, clauses.join(", "));
+                    filters.append_to(&mut sql, &mut params);
+                    sql.push_str(&format!(" RETURNING {}", M::SELECT_COLUMNS));
+                    Ok((sql, params))
+                }
+
+                async fn run(
+                    pool: ConnectionPool,
+                    mut values: ColumnValues,
+                    mut filters: Filters,
+                    arithmetic: Vec<(usize, &'static str, i64)>,
+                    allow_all_rows: bool,
+                ) -> Result<MutationOutcome, BoxError> {
+                    let (sql, params) =
+                        Self::build(&mut values, &mut filters, &arithmetic, allow_all_rows)?;
+                    debug::log_query(&sql, params.len());
+                    let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
+                    let refs = as_sql_refs(&params);
+                    Ok(MutationOutcome::Rows(client.query(&sql, &refs[..]).await?))
+                }
+
+                /// Runs the update and returns every row it changed. `.await`
+                /// returns only the first one.
+                pub async fn all(mut self) -> Result<Vec<M>, BoxError> {
+                    let (values, filters, arithmetic) = self.take_state();
+                    let outcome = Self::run(
+                        self.pool.clone(),
+                        values,
+                        filters,
+                        arithmetic,
+                        self.allow_all_rows,
+                    )
+                    .await?;
+                    match outcome {
+                        MutationOutcome::Rows(rows) => {
+                            Ok(rows.iter().map(|row| M::from_row(row)).collect())
+                        }
+                        MutationOutcome::Count(_) => Ok(vec![]),
+                    }
+                }
+            }
+
+            impl<M: ModelMeta + 'static> Mutation<M, DeleteMode> {
+                fn build(filters: &mut Filters) -> Result<(String, Vec<SqlArg>), BoxError> {
+                    if filters.is_empty() {
+                        return Err("DELETE without WHERE clause is not allowed".into());
+                    }
+                    let mut sql = format!("DELETE FROM {}", M::TABLE);
+                    let mut params: Vec<SqlArg> = vec![];
+                    filters.append_to(&mut sql, &mut params);
+                    Ok((sql, params))
+                }
+
+                async fn run(
+                    pool: ConnectionPool,
+                    mut filters: Filters,
+                ) -> Result<MutationOutcome, BoxError> {
+                    let (sql, params) = Self::build(&mut filters)?;
+                    debug::log_query(&sql, params.len());
+                    let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
+                    let refs = as_sql_refs(&params);
+                    Ok(MutationOutcome::Count(client.execute(&sql, &refs[..]).await?))
+                }
+            }
+
+            impl<M: ModelMeta + 'static> Mutation<M, UpsertMode> {
+                fn build(
+                    values: &mut ColumnValues,
+                    arithmetic: &[(usize, &'static str, i64)],
+                ) -> Result<(String, Vec<SqlArg>), BoxError> {
+                    if let Some(column) = values.first_missing(M::PK_MASK) {
+                        return Err(format!("Missing primary key field: {}", column).into());
+                    }
+                    if values.is_empty() {
+                        return Err("No fields to upsert".into());
+                    }
+
+                    let pk_columns: Vec<&'static str> = (0..u128::BITS as usize)
+                        .filter(|index| M::PK_MASK & (1u128 << index) != 0)
+                        .map(|index| values.column(index))
+                        .collect();
+
+                    let arithmetic_columns: Vec<(&'static str, &'static str, i64)> = arithmetic
+                        .iter()
+                        .map(|(index, op, value)| (values.column(*index), *op, *value))
+                        .collect();
+
+                    let mut params: Vec<SqlArg> = vec![];
+                    let (columns, placeholders) = values.take_into(&mut params);
+
+                    let update_columns: Vec<&'static str> = columns
+                        .iter()
+                        .copied()
+                        .filter(|column| !pk_columns.contains(column))
+                        .collect();
+
+                    let conflict_clause = pk_columns.join(", ");
+                    let sql = if update_columns.is_empty() && arithmetic_columns.is_empty() {
+                        format!(
+                            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO NOTHING RETURNING {}",
+                            M::TABLE,
+                            columns.join(", "),
+                            placeholders.join(", "),
+                            conflict_clause,
+                            M::SELECT_COLUMNS
+                        )
+                    } else {
+                        let assignments: Vec<String> = update_columns
+                            .iter()
+                            .map(|column| {
+                                match arithmetic_columns.iter().find(|(name, _, _)| name == column) {
+                                    Some((_, op, value)) => {
+                                        let symbol = match *op {
+                                            "inc" => "+",
+                                            "dec" => "-",
+                                            "mul" => "*",
+                                            "div" => "/",
+                                            _ => return format!("{} = EXCLUDED.{}", column, column),
+                                        };
+                                        let value = if *op == "dec" { value.abs() } else { *value };
+                                        format!(
+                                            "{} = COALESCE({}.{}, 0) {} {}",
+                                            column, M::TABLE, column, symbol, value
+                                        )
+                                    }
+                                    None => format!("{} = EXCLUDED.{}", column, column),
+                                }
+                            })
+                            .collect();
+
+                        format!(
+                            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {} RETURNING {}",
+                            M::TABLE,
+                            columns.join(", "),
+                            placeholders.join(", "),
+                            conflict_clause,
+                            assignments.join(", "),
+                            M::SELECT_COLUMNS
+                        )
+                    };
+
+                    Ok((sql, params))
+                }
+
+                async fn run(
+                    pool: ConnectionPool,
+                    mut values: ColumnValues,
+                    arithmetic: Vec<(usize, &'static str, i64)>,
+                ) -> Result<MutationOutcome, BoxError> {
+                    let (sql, params) = Self::build(&mut values, &arithmetic)?;
+                    debug::log_query(&sql, params.len());
+                    let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
+                    let refs = as_sql_refs(&params);
+                    Ok(MutationOutcome::Rows(vec![client.query_one(&sql, &refs[..]).await?]))
+                }
+            }
+
+            /// Drives the queued statement and hands back the first row.
+            fn poll_single_row<M: ModelMeta>(
+                fut: &mut std::pin::Pin<Box<dyn std::future::Future<
+                    Output = Result<MutationOutcome, BoxError>
+                > + Send>>,
+                cx: &mut std::task::Context<'_>,
+                empty: &'static str,
+            ) -> std::task::Poll<Result<M, BoxError>> {
+                match fut.as_mut().poll(cx) {
+                    std::task::Poll::Ready(Ok(MutationOutcome::Rows(rows))) => {
+                        std::task::Poll::Ready(match rows.first() {
+                            Some(row) => Ok(M::from_row(row)),
+                            None => Err(empty.into()),
+                        })
+                    }
+                    std::task::Poll::Ready(Ok(MutationOutcome::Count(_))) => {
+                        std::task::Poll::Ready(Err(empty.into()))
+                    }
+                    std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                }
+            }
+
+            impl<M: ModelMeta + 'static> std::future::Future for Mutation<M, CreateMode> {
+                type Output = Result<M, BoxError>;
+
+                fn poll(
+                    mut self: std::pin::Pin<&mut Self>,
+                    cx: &mut std::task::Context<'_>,
+                ) -> std::task::Poll<Self::Output> {
+                    let me = &mut *self;
+                    if me.fut.is_none() {
+                        let (values, filters, _) = me.take_state();
+                        me.fut = Some(Box::pin(Self::run(me.pool.clone(), values, filters)));
+                    }
+                    poll_single_row::<M>(me.fut.as_mut().unwrap(), cx, "INSERT returned no rows")
+                }
+            }
+
+            impl<M: ModelMeta + 'static> std::future::Future for Mutation<M, UpdateMode> {
+                type Output = Result<M, BoxError>;
+
+                fn poll(
+                    mut self: std::pin::Pin<&mut Self>,
+                    cx: &mut std::task::Context<'_>,
+                ) -> std::task::Poll<Self::Output> {
+                    let me = &mut *self;
+                    if me.fut.is_none() {
+                        let (values, filters, arithmetic) = me.take_state();
+                        me.fut = Some(Box::pin(Self::run(
+                            me.pool.clone(),
+                            values,
+                            filters,
+                            arithmetic,
+                            me.allow_all_rows,
+                        )));
+                    }
+                    poll_single_row::<M>(me.fut.as_mut().unwrap(), cx, "UPDATE matched no rows")
+                }
+            }
+
+            impl<M: ModelMeta + 'static> std::future::Future for Mutation<M, UpsertMode> {
+                type Output = Result<M, BoxError>;
+
+                fn poll(
+                    mut self: std::pin::Pin<&mut Self>,
+                    cx: &mut std::task::Context<'_>,
+                ) -> std::task::Poll<Self::Output> {
+                    let me = &mut *self;
+                    if me.fut.is_none() {
+                        let (values, _, arithmetic) = me.take_state();
+                        me.fut = Some(Box::pin(Self::run(me.pool.clone(), values, arithmetic)));
+                    }
+                    poll_single_row::<M>(me.fut.as_mut().unwrap(), cx, "UPSERT returned no rows")
+                }
+            }
+
+            impl<M: ModelMeta + 'static> std::future::Future for Mutation<M, DeleteMode> {
+                type Output = Result<u64, BoxError>;
+
+                fn poll(
+                    mut self: std::pin::Pin<&mut Self>,
+                    cx: &mut std::task::Context<'_>,
+                ) -> std::task::Poll<Self::Output> {
+                    let me = &mut *self;
+                    if me.fut.is_none() {
+                        let (_, filters, _) = me.take_state();
+                        me.fut = Some(Box::pin(Self::run(me.pool.clone(), filters)));
+                    }
+                    match me.fut.as_mut().unwrap().as_mut().poll(cx) {
+                        std::task::Poll::Ready(Ok(MutationOutcome::Count(count))) => {
+                            std::task::Poll::Ready(Ok(count))
+                        }
+                        std::task::Poll::Ready(Ok(MutationOutcome::Rows(rows))) => {
+                            std::task::Poll::Ready(Ok(rows.len() as u64))
+                        }
+                        std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+                        std::task::Poll::Pending => std::task::Poll::Pending,
+                    }
+                }
+            }
+
 
             pub async fn insert_many(
                 pool: ConnectionPool,
@@ -1068,10 +1322,15 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                     })
                 }
 
-                pub fn push(&mut self, create: CreateCore, update: UpdateCore) -> Result<(), BoxError> {
-                    create.check_required()?;
-                    let (mut values, create_filters) = create.into_parts();
-                    let (assignments, set_args, arithmetic, update_filters) = update.into_parts();
+                pub fn push<M: ModelMeta + 'static>(
+                    &mut self,
+                    create: Mutation<M, CreateMode>,
+                    update: Mutation<M, UpdateMode>,
+                ) -> Result<(), BoxError> {
+                    let (mut values, create_filters, create_arithmetic) = create.into_parts();
+                    let (update_values, update_filters, update_arithmetic) = update.into_parts();
+
+                    Mutation::<M, CreateMode>::check_required(&values)?;
 
                     if !create_filters.is_empty() {
                         return Err("upsert_many does not support create where clauses".into());
@@ -1079,11 +1338,8 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                     if !update_filters.is_empty() {
                         return Err("upsert_many does not support update where clauses".into());
                     }
-                    if !arithmetic.is_empty() {
+                    if !create_arithmetic.is_empty() || !update_arithmetic.is_empty() {
                         return Err("upsert_many does not support increment operations".into());
-                    }
-                    if assignments.len() != set_args.len() {
-                        return Err("Invalid update builder state".into());
                     }
                     if values.is_empty() {
                         return Err("No fields to upsert".into());
@@ -1104,29 +1360,13 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                         None => self.insert_mask = Some(present),
                     }
 
-                    let mut seen = std::collections::HashSet::new();
-                    let mut update_mask = 0u128;
-                    for assignment in assignments {
-                        if !seen.insert(assignment.column) {
-                            return Err(format!(
-                                "Duplicate update field in upsert_many: {}",
-                                assignment.column
-                            )
-                            .into());
-                        }
-                        match (0..u128::BITS as usize).find(|index| {
-                            present & (1u128 << index) != 0
-                                && values.column(*index) == assignment.column
-                        }) {
-                            Some(index) => update_mask |= 1u128 << index,
-                            None => {
-                                return Err(format!(
-                                    "Update field '{}' must also be set in create builder",
-                                    assignment.column
-                                )
-                                .into())
-                            }
-                        }
+                    let update_mask = update_values.present();
+                    if let Some(column) = update_values.first_missing(update_mask & !present) {
+                        return Err(format!(
+                            "Update field '{}' must also be set in create builder",
+                            column
+                        )
+                        .into());
                     }
 
                     match self.update_mask {
@@ -1138,7 +1378,7 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                             self.update_mask = Some(update_mask);
                             self.update_columns = (0..u128::BITS as usize)
                                 .filter(|index| update_mask & (1u128 << index) != 0)
-                                .map(|index| values.column(index))
+                                .map(|index| update_values.column(index))
                                 .collect();
                         }
                     }
@@ -1185,129 +1425,6 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                     let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
                     let refs = as_sql_refs(&self.params);
                     Ok(client.execute(&sql, &refs[..]).await?)
-                }
-            }
-
-            pub struct UpsertCore {
-                table: &'static str,
-                select_columns: &'static str,
-                pk_mask: u128,
-                values: ColumnValues,
-                arithmetic: Vec<(usize, &'static str, i64)>,
-            }
-
-            impl UpsertCore {
-                pub fn new(
-                    table: &'static str,
-                    select_columns: &'static str,
-                    columns: &'static [&'static str],
-                    casts: &'static [Option<&'static str>],
-                    pk_mask: u128,
-                ) -> Self {
-                    Self {
-                        table,
-                        select_columns,
-                        pk_mask,
-                        values: ColumnValues::new(columns, casts),
-                        arithmetic: vec![],
-                    }
-                }
-
-                pub fn push_value(&mut self, index: usize, value: SqlArg) {
-                    self.values.set(index, value);
-                }
-
-                /// The inserted row carries the operand; the operator is
-                /// applied to the existing row on conflict.
-                pub fn push_arithmetic(&mut self, index: usize, op: &'static str, value: i64, seed: SqlArg) {
-                    self.arithmetic.push((index, op, value));
-                    self.values.set(index, seed);
-                }
-
-                pub fn build(&mut self) -> Result<(String, Vec<SqlArg>), BoxError> {
-                    if let Some(column) = self.values.first_missing(self.pk_mask) {
-                        return Err(format!("Missing primary key field: {}", column).into());
-                    }
-                    if self.values.is_empty() {
-                        return Err("No fields to upsert".into());
-                    }
-
-                    let pk_columns: Vec<&'static str> = (0..u128::BITS as usize)
-                        .filter(|index| self.pk_mask & (1u128 << index) != 0)
-                        .map(|index| self.values.column(index))
-                        .collect();
-
-                    let arithmetic: Vec<(&'static str, &'static str, i64)> = self
-                        .arithmetic
-                        .drain(..)
-                        .map(|(index, op, value)| (self.values.column(index), op, value))
-                        .collect();
-
-                    let mut params: Vec<SqlArg> = vec![];
-                    let (columns, placeholders) = self.values.take_into(&mut params);
-
-                    let update_columns: Vec<&'static str> = columns
-                        .iter()
-                        .copied()
-                        .filter(|column| !pk_columns.contains(column))
-                        .collect();
-
-                    let conflict_clause = pk_columns.join(", ");
-                    let sql = if update_columns.is_empty() && arithmetic.is_empty() {
-                        format!(
-                            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO NOTHING RETURNING {}",
-                            self.table,
-                            columns.join(", "),
-                            placeholders.join(", "),
-                            conflict_clause,
-                            self.select_columns
-                        )
-                    } else {
-                        let assignments: Vec<String> = update_columns
-                            .iter()
-                            .map(|column| {
-                                match arithmetic.iter().find(|(name, _, _)| name == column) {
-                                    Some((_, op, value)) => {
-                                        let symbol = match *op {
-                                            "inc" => "+",
-                                            "dec" => "-",
-                                            "mul" => "*",
-                                            "div" => "/",
-                                            _ => return format!("{} = EXCLUDED.{}", column, column),
-                                        };
-                                        let value = if *op == "dec" { value.abs() } else { *value };
-                                        format!(
-                                            "{} = COALESCE({}.{}, 0) {} {}",
-                                            column, self.table, column, symbol, value
-                                        )
-                                    }
-                                    None => format!("{} = EXCLUDED.{}", column, column),
-                                }
-                            })
-                            .collect();
-
-                        format!(
-                            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {} RETURNING {}",
-                            self.table,
-                            columns.join(", "),
-                            placeholders.join(", "),
-                            conflict_clause,
-                            assignments.join(", "),
-                            self.select_columns
-                        )
-                    };
-
-                    Ok((sql, params))
-                }
-
-                pub async fn execute(mut self, pool: ConnectionPool)
-                    -> Result<tokio_postgres::Row, BoxError>
-                {
-                    let (sql, params) = self.build()?;
-                    debug::log_query(&sql, params.len());
-                    let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
-                    let refs = as_sql_refs(&params);
-                    Ok(client.query_one(&sql, &refs[..]).await?)
                 }
             }
 
@@ -1896,38 +2013,6 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                 }
             }
 
-            pub struct DeleteCore {
-                table: &'static str,
-                filters: Filters,
-            }
-
-            impl DeleteCore {
-                pub fn new(table: &'static str) -> Self {
-                    Self { table, filters: Filters::new() }
-                }
-
-                pub fn filters(&mut self) -> &mut Filters {
-                    &mut self.filters
-                }
-
-                pub fn build(&mut self) -> Result<(String, Vec<SqlArg>), BoxError> {
-                    if self.filters.is_empty() {
-                        return Err("DELETE without WHERE clause is not allowed".into());
-                    }
-                    let mut sql = format!("DELETE FROM {}", self.table);
-                    let mut params: Vec<SqlArg> = vec![];
-                    self.filters.append_to(&mut sql, &mut params);
-                    Ok((sql, params))
-                }
-
-                pub async fn execute(mut self, pool: ConnectionPool) -> Result<u64, BoxError> {
-                    let (sql, params) = self.build()?;
-                    debug::log_query(&sql, params.len());
-                    let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
-                    let refs = as_sql_refs(&params);
-                    Ok(client.execute(&sql, &refs[..]).await?)
-                }
-            }
         }
 
         pub mod debug {
