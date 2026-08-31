@@ -1,0 +1,44 @@
+# Highlighting for ByteORM `.bo` schema files.
+#
+# Vocabulary and colours mirror the IntelliJ plugin (ByteormLexer.kt and
+# ByteormSyntaxHighlighter.kt), so a schema reads the same in the docs as in the editor.
+#
+# The plugin's palette targets a dark editor, so `light` holds darkened counterparts:
+# same hue, enough contrast on a white background.
+
+name = "bo"
+aliases = ["byteorm"]
+
+line_comment = "//"
+attribute_prefix = "@"
+declaration_after = ["keyword"]
+operators = "?"
+
+[words]
+keyword = ["model", "enum"]
+type = [
+    "String", "Text", "Int", "BigInt", "Float", "Real",
+    "Boolean", "Date", "TimestamptZ", "JsonB", "Jsonb", "Serial",
+]
+modifier = [
+    "ForeignKey", "Not", "Null", "PrimaryKey", "NotNull", "Nullable",
+    "Unique", "Index", "onDelete", "cascade", "restrict", "set", "null",
+    "no", "action",
+]
+literal = ["now", "true", "false"]
+
+[colours]
+keyword     = { light = "#1d4ed8", dark = "#3b82f6" }
+attribute   = { light = "#15803d", dark = "#22c55e" }
+modifier    = { light = "#b45309", dark = "#f59e0b" }
+type        = { light = "#0e7490", dark = "#22d3ee" }
+declaration = { light = "#047857", dark = "#86efac" }
+identifier  = { light = "#1e293b", dark = "#f8fafc" }
+string      = { light = "#be185d", dark = "#f9a8d4" }
+literal     = { light = "#a21caf", dark = "#d946ef" }
+number      = { light = "#a21caf", dark = "#d946ef" }
+comment     = { light = "#64748b", dark = "#94a3b8" }
+brace       = { light = "#a16207", dark = "#eab308" }
+paren       = { light = "#7e22ce", dark = "#c084fc" }
+punctuation = { light = "#64748b", dark = "#64748b" }
+operator    = { light = "#a21caf", dark = "#d83bc9" }

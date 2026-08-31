@@ -1,0 +1,65 @@
+name: Docs
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "website/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: website
+
+      - name: Install the CLIs
+        run: |
+          cargo install dioxus-cli --locked
+          cargo install --git https://github.com/bytematebot/dioxus-press --locked
+
+      # Pages serves a project site from /<repo>, so assets and router links need
+      # that prefix. The router reads it from the same flag.
+      - name: Build
+        working-directory: website
+        run: dxpress build --base-path ${{ github.event.repository.name }}
+
+      # The build is a single-page app, and Pages answers an unknown path with
+      # 404.html. Serving the app there lets a deep link resolve client-side.
+      - name: Add the SPA fallback
+        working-directory: website
+        run: cp dist/index.html dist/404.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

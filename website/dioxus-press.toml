@@ -1,0 +1,6 @@
+title = "ByteORM"
+description = "ByteORM is a fast, type-safe ORM for PostgreSQL in Rust."
+docs_dir = "docs"
+
+base_path = "/docs"
+

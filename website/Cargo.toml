@@ -1,0 +1,23 @@
+[package]
+name = "docs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+dioxus = { version = "0.8.0-alpha.1", features = ["router"] }
+dioxus-router = "0.8.0-alpha.1"
+dioxus-press = { git = "https://github.com/bytematebot/dioxus-press", branch = "main", default-features = false }
+
+[features]
+default = ["web"]
+web = ["dioxus/web"]
+server = ["dioxus/server", "dioxus/fullstack"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "debuginfo"
