@@ -35,7 +35,7 @@ jobs:
 
       - name: Install the CLIs
         run: |
-          cargo install dioxus-cli --locked
+          cargo install dioxus-cli --version 0.8.0-alpha.1 --locked
           cargo install --git https://github.com/bytematebot/dioxus-press --locked
 
       # Pages serves a project site from /<repo>, so assets and router links need
