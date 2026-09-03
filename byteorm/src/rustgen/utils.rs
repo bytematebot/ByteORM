@@ -25,7 +25,7 @@ pub fn rust_type_from_schema(type_name: &str, nullable: bool) -> TokenStream {
     let base_type = match type_name {
         "BigInt" => quote! { i64 },
         "Int" => quote! { i32 },
-        "String" => quote! { String },
+        "String" | "Text" => quote! { String },
         "JsonB" | "Jsonb" => quote! { serde_json::Value },
         "TimestamptZ" | "Timestamp" => quote! { DateTime<Utc> },
         "Date" => quote! { NaiveDate },
