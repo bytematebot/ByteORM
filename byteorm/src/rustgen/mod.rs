@@ -2070,7 +2070,13 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
             pub async fn get(&self) -> Result<PooledClient, tokio_postgres::Error> {
                 match self {
                     ConnectionPool::Pooled(pool) => {
-                        let conn = pool.get().await.map_err(|_| tokio_postgres::Error::__private_api_timeout())?;
+                        // A pool error does not fit in a `tokio_postgres::Error`,
+                        // and callers collapse this to "Failed to get connection
+                        // from pool", so print the real cause before losing it.
+                        let conn = pool.get().await.map_err(|e| {
+                            eprintln!("[byteorm] connection pool error: {}", e);
+                            tokio_postgres::Error::__private_api_timeout()
+                        })?;
                         Ok(PooledClient::Pooled(conn))
                     }
                     ConnectionPool::Pinned(client) => {
@@ -2169,10 +2175,38 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                     deadpool_postgres::Manager::from_config(pg_config, tls, manager_config)
                 };
 
+                // deadpool sets no timeouts by default, so a pool that cannot
+                // hand out a connection — unreachable database, hung TLS
+                // handshake, every slot checked out — parks the caller forever
+                // with no error and no log. Bound all three waits instead.
                 let pool = deadpool_postgres::Pool::builder(manager)
-                    .max_size(20)
+                    .max_size(
+                        std::env::var("BYTEORM_POOL_MAX_SIZE")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(20),
+                    )
+                    // The create and recycle timeouts need a runtime to time out against.
+                    .runtime(deadpool_postgres::Runtime::Tokio1)
+                    .timeouts(deadpool_postgres::Timeouts {
+                        wait: Some(std::time::Duration::from_secs(10)),
+                        create: Some(std::time::Duration::from_secs(10)),
+                        recycle: Some(std::time::Duration::from_secs(10)),
+                    })
                     .build()
                     .map_err(|_| tokio_postgres::Error::__private_api_timeout())?;
+
+                // The pool is lazy, so without this `new` succeeds against a
+                // database that is not there and the failure only surfaces as
+                // the first query hanging, far from the cause.
+                {
+                    let probe = pool.get().await.map_err(|e| {
+                        eprintln!("[byteorm] cannot connect to the database: {}", e);
+                        tokio_postgres::Error::__private_api_timeout()
+                    })?;
+                    probe.batch_execute("SELECT 1").await?;
+                }
+
                 let pool = ConnectionPool::Pooled(pool);
 
                 Ok(Self {
