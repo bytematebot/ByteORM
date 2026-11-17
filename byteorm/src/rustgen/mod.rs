@@ -389,16 +389,10 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
             (clauses, next_param)
         }
 
-        /// Shared statement machinery. Generated builders are thin wrappers
-        /// over these types, so the SQL assembly and execution code is
-        /// compiled once for the whole crate rather than once per model.
         #[doc(hidden)]
         pub mod __private {
-            use super::{ConnectionPool, FromRow, JsonbExt, ModelMeta, WhereOp, WherePredicate, debug, render_where_predicates};
+            use super::{ConnectionPool, FromRow, JsonbExt, ModelMeta, PooledClient, WhereOp, WherePredicate, debug, render_where_predicates};
 
-            /// A bound parameter. Common column types are stored inline;
-            /// anything else (nullable columns, `where_raw`, enums the
-            /// generator does not recognise) falls back to a box.
             #[derive(Debug)]
             pub enum SqlArg {
                 I32(i32),
@@ -806,6 +800,21 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                     &mut self.filters
                 }
 
+                pub fn __filter(mut self, column: &'static str, op: WhereOp, value: SqlArg) -> Self {
+                    self.filters.push(column, op, value);
+                    self
+                }
+
+                pub fn __filter_in(mut self, column: &'static str, values: Vec<SqlArg>) -> Self {
+                    self.filters.push_in(column, values);
+                    self
+                }
+
+                pub fn __filter_bare(mut self, column: &'static str, op: WhereOp) -> Self {
+                    self.filters.push_bare(column, op);
+                    self
+                }
+
                 pub fn push_value(&mut self, index: usize, value: SqlArg) {
                     self.values.set(index, value);
                 }
@@ -1208,6 +1217,224 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
                 }
             }
 
+            pub struct Accessor<M> {
+                pool: ConnectionPool,
+                model: std::marker::PhantomData<fn() -> M>,
+            }
+
+            impl<M> Clone for Accessor<M> {
+                fn clone(&self) -> Self {
+                    Self { pool: self.pool.clone(), model: std::marker::PhantomData }
+                }
+            }
+
+            impl<M: ModelMeta> Accessor<M> {
+                pub fn new(pool: ConnectionPool) -> Self {
+                    Self { pool, model: std::marker::PhantomData }
+                }
+
+                pub fn pool(&self) -> &ConnectionPool {
+                    &self.pool
+                }
+
+                pub async fn get_client(&self) -> Result<PooledClient, tokio_postgres::Error> {
+                    self.pool.get().await
+                }
+
+                pub fn query(&self) -> Query<M, Executable> {
+                    Query::<M, Executable>::new(self.pool.clone())
+                }
+
+                pub async fn find_many<F>(&self, f: F) -> Result<Vec<M>, BoxError>
+                where
+                    F: FnOnce(Query<M, WhereOnly>) -> Query<M, WhereOnly>,
+                {
+                    let builder = f(Query::<M, WhereOnly>::new());
+                    Query::from_builder(self.pool.clone(), builder).await
+                }
+
+                pub async fn find_first<F>(&self, f: F) -> Result<Option<M>, BoxError>
+                where
+                    F: FnOnce(Query<M, WhereOnly>) -> Query<M, WhereOnly>,
+                {
+                    let builder = f(Query::<M, WhereOnly>::new());
+                    Query::from_builder(self.pool.clone(), builder).first().await
+                }
+
+                pub async fn count<F>(&self, f: F) -> Result<i64, BoxError>
+                where
+                    F: FnOnce(Query<M, WhereOnly>) -> Query<M, WhereOnly>,
+                {
+                    let builder = f(Query::<M, WhereOnly>::new());
+                    Query::from_builder(self.pool.clone(), builder).count().await
+                }
+
+                pub async fn sum<F, T>(&self, f: F, field: &str) -> Result<T, BoxError>
+                where
+                    F: FnOnce(Query<M, WhereOnly>) -> Query<M, WhereOnly>,
+                    T: for<'a> tokio_postgres::types::FromSql<'a>
+                        + Default
+                        + tokio_postgres::types::ToSql
+                        + Sync,
+                {
+                    let builder = f(Query::<M, WhereOnly>::new());
+                    Query::from_builder(self.pool.clone(), builder).sum(field).await
+                }
+
+                pub async fn sum_cast_i64<F>(&self, f: F, field: &str) -> Result<i64, BoxError>
+                where
+                    F: FnOnce(Query<M, WhereOnly>) -> Query<M, WhereOnly>,
+                {
+                    let builder = f(Query::<M, WhereOnly>::new());
+                    Query::from_builder(self.pool.clone(), builder).sum_cast_i64(field).await
+                }
+
+                pub async fn avg<F, T>(&self, f: F, field: &str) -> Result<Option<T>, BoxError>
+                where
+                    F: FnOnce(Query<M, WhereOnly>) -> Query<M, WhereOnly>,
+                    T: for<'a> tokio_postgres::types::FromSql<'a>,
+                {
+                    let builder = f(Query::<M, WhereOnly>::new());
+                    Query::from_builder(self.pool.clone(), builder).avg::<T>(field).await
+                }
+
+                pub async fn min<F, T>(&self, f: F, field: &str) -> Result<Option<T>, BoxError>
+                where
+                    F: FnOnce(Query<M, WhereOnly>) -> Query<M, WhereOnly>,
+                    T: for<'a> tokio_postgres::types::FromSql<'a>,
+                {
+                    let builder = f(Query::<M, WhereOnly>::new());
+                    Query::from_builder(self.pool.clone(), builder).min::<T>(field).await
+                }
+
+                pub async fn max<F, T>(&self, f: F, field: &str) -> Result<Option<T>, BoxError>
+                where
+                    F: FnOnce(Query<M, WhereOnly>) -> Query<M, WhereOnly>,
+                    T: for<'a> tokio_postgres::types::FromSql<'a>,
+                {
+                    let builder = f(Query::<M, WhereOnly>::new());
+                    Query::from_builder(self.pool.clone(), builder).max::<T>(field).await
+                }
+
+                pub fn update<F>(&self, f: F) -> Mutation<M, UpdateMode>
+                where
+                    F: FnOnce(Mutation<M, UpdateMode>) -> Mutation<M, UpdateMode>,
+                {
+                    f(Mutation::new(self.pool.clone()))
+                }
+
+                pub fn upsert<F>(&self, f: F) -> Mutation<M, UpsertMode>
+                where
+                    F: FnOnce(Mutation<M, UpsertMode>) -> Mutation<M, UpsertMode>,
+                {
+                    f(Mutation::new(self.pool.clone()))
+                }
+
+                pub fn create<F>(&self, f: F) -> Mutation<M, CreateMode>
+                where
+                    F: FnOnce(Mutation<M, CreateMode>) -> Mutation<M, CreateMode>,
+                {
+                    f(Mutation::new(self.pool.clone()))
+                }
+
+                pub fn delete<F>(&self, f: F) -> Mutation<M, DeleteMode>
+                where
+                    F: FnOnce(Mutation<M, DeleteMode>) -> Mutation<M, DeleteMode>,
+                {
+                    f(Mutation::new(self.pool.clone()))
+                }
+
+                pub async fn create_many(
+                    &self,
+                    records: Vec<std::collections::HashMap<
+                        &'static str,
+                        Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
+                    >>,
+                ) -> Result<u64, BoxError> {
+                    insert_many(self.pool.clone(), M::TABLE, records).await
+                }
+            }
+
+            impl<M: ModelMeta + 'static> Accessor<M> {
+                /// Body of a model's `upsert_many`; the model supplies how its
+                /// conflict selector turns into column names.
+                pub async fn upsert_many_by<T, FC, FU>(
+                    &self,
+                    records: Vec<T>,
+                    conflict_columns: impl FnOnce() -> Vec<&'static str>,
+                    mut create: FC,
+                    mut update: FU,
+                ) -> Result<u64, BoxError>
+                where
+                    T: Clone,
+                    FC: FnMut(Mutation<M, CreateMode>, T) -> Mutation<M, CreateMode>,
+                    FU: FnMut(Mutation<M, UpdateMode>, T) -> Mutation<M, UpdateMode>,
+                {
+                    if records.is_empty() {
+                        return Ok(0);
+                    }
+
+                    let mut batch = UpsertBatch::new(M::TABLE, M::COLUMNS, conflict_columns())?;
+
+                    for record in records {
+                        let create_builder = create(Mutation::new(self.pool.clone()), record.clone());
+                        let update_builder = update(Mutation::new(self.pool.clone()), record);
+                        batch.push(create_builder, update_builder)?;
+                    }
+
+                    batch.execute(self.pool.clone()).await
+                }
+            }
+
+            /// `SELECT ... WHERE <pk> = $1 [AND ...]`. `keys` follow the
+            /// order of the primary key columns in the schema.
+            pub async fn find_by_pk<M: ModelMeta>(
+                pool: &ConnectionPool,
+                keys: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+            ) -> Result<Option<M>, BoxError> {
+                let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
+                let conditions: Vec<String> = M::PK_COLUMNS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, column)| format!("{} = ${}", column, i + 1))
+                    .collect();
+                let sql = format!(
+                    "SELECT {} FROM {} WHERE {}",
+                    M::SELECT_COLUMNS,
+                    M::TABLE,
+                    conditions.join(" AND ")
+                );
+                debug::log_query(&sql, keys.len());
+                let row = client.query_opt(&sql, keys).await?;
+                Ok(row.map(|row| M::from_row(&row)))
+            }
+
+            pub async fn find_or_create_by_pk<M: ModelMeta>(
+                pool: &ConnectionPool,
+                keys: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+            ) -> Result<M, BoxError> {
+                let columns = M::PK_COLUMNS.join(", ");
+                let placeholders: Vec<String> =
+                    (1..=keys.len()).map(|i| format!("${}", i)).collect();
+                let sql = format!(
+                    "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO NOTHING RETURNING {}",
+                    M::TABLE,
+                    columns,
+                    placeholders.join(", "),
+                    columns,
+                    M::SELECT_COLUMNS
+                );
+                debug::log_query(&sql, keys.len());
+                let client = pool.get().await.map_err(|_| "Failed to get connection from pool")?;
+                let rows = client.query(&sql, keys).await?;
+                if let Some(row) = rows.first() {
+                    Ok(M::from_row(row))
+                } else {
+                    find_by_pk::<M>(pool, keys)
+                        .await?
+                        .ok_or("Record should exist after find_or_create".into())
+                }
+            }
 
             pub async fn insert_many(
                 pool: ConnectionPool,
@@ -1610,6 +1837,21 @@ pub fn generate_rust_code(schema: &Schema) -> HashMap<String, String> {
             impl<M, S> Query<M, S> {
                 pub fn core(&mut self) -> &mut QueryCore {
                     &mut self.core
+                }
+
+                pub fn __filter(mut self, column: &'static str, op: WhereOp, value: SqlArg) -> Self {
+                    self.core.filters().push(column, op, value);
+                    self
+                }
+
+                pub fn __filter_in(mut self, column: &'static str, values: Vec<SqlArg>) -> Self {
+                    self.core.filters().push_in(column, values);
+                    self
+                }
+
+                pub fn __filter_bare(mut self, column: &'static str, op: WhereOp) -> Self {
+                    self.core.filters().push_bare(column, op);
+                    self
                 }
 
                 pub fn limit(mut self, limit: usize) -> Self {

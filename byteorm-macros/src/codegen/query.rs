@@ -113,7 +113,7 @@ pub fn generate_query_builder_struct(model: &Model) -> TokenStream {
     let builder_name = format_ident!("{}Query", model.name);
     let where_builder_name = format_ident!("{}WhereBuilder", model.name);
 
-    let where_methods: Vec<_> = generate_filter_methods(model, "core().filters()").collect();
+    let where_methods: Vec<_> = generate_filter_methods(model).collect();
     let computed_where_methods = generate_computed_where_methods(model);
     let order_by_methods = generate_order_by_methods(model);
     let include_methods = generate_include_methods(model);

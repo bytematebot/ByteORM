@@ -16,7 +16,7 @@ pub fn generate_mutation_builders(model: &Model) -> TokenStream {
     let delete_builder = format_ident!("{}Delete", model.name);
     let upsert_builder = format_ident!("{}Upsert", model.name);
 
-    let where_methods: Vec<_> = generate_filter_methods(model, "filters()").collect();
+    let where_methods: Vec<_> = generate_filter_methods(model).collect();
     let set_methods: Vec<_> = generate_create_value_methods(model, "").collect();
     let arithmetic_methods = generate_upsert_arithmetic_methods(model);
     let upsert_pk_methods = generate_upsert_pk_methods(model);

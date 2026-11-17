@@ -39,10 +39,10 @@ fn generate_find_unique(model_name: &proc_macro2::Ident, model: &Model) -> Token
         let is_nullable = pk.modifiers.iter().any(|m| matches!(m, Modifier::Nullable));
         let pk_type = rust_type_from_schema(&pk.type_name, is_nullable);
         quote! {
-            pub async fn find_unique(&self, id: #pk_type)
-                -> Result<Option<#model_name>, Box<dyn std::error::Error + Send + Sync>>
+            pub fn find_unique(&self, id: #pk_type)
+                -> impl std::future::Future<Output = Result<Option<#model_name>, Box<dyn std::error::Error + Send + Sync>>>
             {
-                #model_name::find_by_id(self.pool.clone(), id).await
+                #model_name::find_by_id(self.pool().clone(), id)
             }
         }
     } else {
@@ -59,89 +59,34 @@ fn generate_find_unique(model_name: &proc_macro2::Ident, model: &Model) -> Token
         });
 
         quote! {
-            pub async fn find_unique(&self, #(#pk_params),*)
-                -> Result<Option<#model_name>, Box<dyn std::error::Error + Send + Sync>>
+            pub fn find_unique(&self, #(#pk_params),*)
+                -> impl std::future::Future<Output = Result<Option<#model_name>, Box<dyn std::error::Error + Send + Sync>>>
             {
-                #model_name::find_by_composite_pk(self.pool.clone(), #(#pk_args_call),*).await
+                #model_name::find_by_composite_pk(self.pool().clone(), #(#pk_args_call),*)
             }
         }
     }
 }
 
-fn generate_find_or_create(
-    model_name: &proc_macro2::Ident,
-    model: &Model,
-    table_name: &str,
-) -> TokenStream {
-    let pk_fields: Vec<_> = model
-        .fields
+fn generate_find_or_create(model_name: &proc_macro2::Ident, model: &Model) -> TokenStream {
+    let (pk_names, pk_types, _, _, pk_arg_refs) = pk_args(model);
+
+    if pk_names.is_empty() {
+        return quote! {};
+    }
+
+    let pk_params = pk_names
         .iter()
-        .filter(|f| {
-            f.modifiers
-                .iter()
-                .any(|m| matches!(m, Modifier::PrimaryKey))
-        })
-        .collect();
+        .zip(pk_types.iter())
+        .map(|(name, typ)| quote! { #name: #typ });
 
-    if pk_fields.is_empty() {
-        quote! {}
-    } else if pk_fields.len() == 1 {
-        let pk = &pk_fields[0];
-        let is_nullable = pk.modifiers.iter().any(|m| matches!(m, Modifier::Nullable));
-        let pk_type = rust_type_from_schema(&pk.type_name, is_nullable);
-        let pk_col = to_snake_case(&pk.name);
-        let select_columns = generate_select_columns(model);
-        quote! {
-            pub async fn find_or_create(&self, id: #pk_type)
-                -> Result<#model_name, Box<dyn std::error::Error + Send + Sync>>
-            {
-                let sql = format!("INSERT INTO {} ({}) VALUES ($1) ON CONFLICT ({}) DO NOTHING RETURNING {}", #table_name, #pk_col, #pk_col, #select_columns);
-                debug::log_query(&sql, 1);
-                let client = self.pool.get().await.map_err(|_| "Failed to get connection from pool")?;
-                let rows = client.query(&sql, &[&id]).await?;
-                if let Some(row) = rows.first() {
-                    Ok(#model_name::from_row(row))
-                } else {
-                    self.find_unique(id).await?.ok_or("Record should exist after find_or_create".into())
-                }
-            }
-        }
-    } else {
-        let (_, _, pk_cols, pk_placeholders, pk_arg_refs) = pk_args(model);
-
-        let pk_cols_str = pk_cols.join(", ");
-        let pk_placeholders_str = pk_placeholders.join(", ");
-
-        let pk_params = pk_fields.iter().map(|pk| {
-            let name = format_ident!("{}", to_snake_case(&pk.name));
-            let is_nullable = pk.modifiers.iter().any(|m| matches!(m, Modifier::Nullable));
-            let pk_type = rust_type_from_schema(&pk.type_name, is_nullable);
-            quote! { #name: #pk_type }
-        });
-
-        let pk_args_call = pk_fields.iter().map(|pk| {
-            let name = format_ident!("{}", to_snake_case(&pk.name));
-            quote! { #name }
-        });
-
-        let select_columns = generate_select_columns(model);
-
-        quote! {
-            pub async fn find_or_create(&self, #(#pk_params),*)
-                -> Result<#model_name, Box<dyn std::error::Error + Send + Sync>>
-            {
-                let sql = format!(
-                    "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO NOTHING RETURNING {}",
-                    #table_name, #pk_cols_str, #pk_placeholders_str, #pk_cols_str, #select_columns
-                );
-                debug::log_query(&sql, #pk_cols_str.split(", ").count());
-                let client = self.pool.get().await.map_err(|_| "Failed to get connection from pool")?;
-                let rows = client.query(&sql, &[#(#pk_arg_refs),*]).await?;
-                if let Some(row) = rows.first() {
-                    Ok(#model_name::from_row(row))
-                } else {
-                    self.find_unique(#(#pk_args_call),*).await?.ok_or("Record should exist after find_or_create".into())
-                }
+    quote! {
+        pub fn find_or_create(&self, #(#pk_params),*)
+            -> impl std::future::Future<Output = Result<#model_name, Box<dyn std::error::Error + Send + Sync>>>
+        {
+            let pool = self.pool().clone();
+            async move {
+                __private::find_or_create_by_pk::<#model_name>(&pool, &[#(#pk_arg_refs),*]).await
             }
         }
     }
@@ -154,16 +99,11 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
     let conflict_field = format_ident!("{}ConflictField", model.name);
     let conflict_selector = format_ident!("{}ConflictSelector", model.name);
     let conflict_target = format_ident!("{}ConflictTarget", model.name);
-    let query_builder = format_ident!("{}Query", model.name);
     let update_builder = format_ident!("{}Update", model.name);
-    let upsert_builder = format_ident!("{}Upsert", model.name);
     let create_builder = format_ident!("{}Create", model.name);
-    let delete_builder = format_ident!("{}Delete", model.name);
     let where_builder = format_ident!("{}WhereBuilder", model.name);
-    let table_name = model.name.to_lowercase();
-
     let find_unique = generate_find_unique(&model_name, model);
-    let find_or_create = generate_find_or_create(&model_name, model, &table_name);
+    let find_or_create = generate_find_or_create(&model_name, model);
 
     let conflict_selector_fields = model.fields.iter().map(|field| {
         let field_name = format_ident!("{}", to_snake_case(&field.name));
@@ -180,52 +120,21 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
         let field_methods = categories.numeric_fields.iter().map(|field| {
             let col_snake = to_snake_case(&field.name);
             let sum_name = format_ident!("sum_{}", col_snake);
-            match field.type_name.as_str() {
-                "Int" | "Serial" => {
-                    quote! {
-                        pub async fn #sum_name<F>(&self, f: F) -> Result<i64, Box<dyn std::error::Error + Send + Sync>>
-                        where
-                            F: FnOnce(#where_builder) -> #where_builder,
-                        {
-                            let builder = f(#where_builder::new());
-                            #query_builder::from_builder(self.pool.clone(), builder).sum::<i64>(#col_snake).await
-                        }
-                    }
+            let (ret, call) = match field.type_name.as_str() {
+                "Int" | "Serial" => (quote! { i64 }, quote! { self.sum::<F, i64>(f, #col_snake) }),
+                "BigInt" => (quote! { i64 }, quote! { self.sum_cast_i64(f, #col_snake) }),
+                "Float" => (quote! { f64 }, quote! { self.sum::<F, f64>(f, #col_snake) }),
+                "Real" => (quote! { f32 }, quote! { self.sum::<F, f32>(f, #col_snake) }),
+                _ => return quote! {},
+            };
+            quote! {
+                pub fn #sum_name<F>(&self, f: F)
+                    -> impl std::future::Future<Output = Result<#ret, Box<dyn std::error::Error + Send + Sync>>>
+                where
+                    F: FnOnce(#where_builder) -> #where_builder,
+                {
+                    #call
                 }
-                "BigInt" => {
-                    quote! {
-                        pub async fn #sum_name<F>(&self, f: F) -> Result<i64, Box<dyn std::error::Error + Send + Sync>>
-                        where
-                            F: FnOnce(#where_builder) -> #where_builder,
-                        {
-                            let builder = f(#where_builder::new());
-                            #query_builder::from_builder(self.pool.clone(), builder).sum_cast_i64(#col_snake).await
-                        }
-                    }
-                }
-                "Float" => {
-                    quote! {
-                        pub async fn #sum_name<F>(&self, f: F) -> Result<f64, Box<dyn std::error::Error + Send + Sync>>
-                        where
-                            F: FnOnce(#where_builder) -> #where_builder,
-                        {
-                            let builder = f(#where_builder::new());
-                            #query_builder::from_builder(self.pool.clone(), builder).sum::<f64>(#col_snake).await
-                        }
-                    }
-                }
-                "Real" => {
-                    quote! {
-                        pub async fn #sum_name<F>(&self, f: F) -> Result<f32, Box<dyn std::error::Error + Send + Sync>>
-                        where
-                            F: FnOnce(#where_builder) -> #where_builder,
-                        {
-                            let builder = f(#where_builder::new());
-                            #query_builder::from_builder(self.pool.clone(), builder).sum::<f32>(#col_snake).await
-                        }
-                    }
-                }
-                _ => quote! {},
             }
         });
         quote! { #(#field_methods)* }
@@ -268,8 +177,16 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
 
         #[derive(Clone)]
         pub struct #accessor_struct {
-            pool: ConnectionPool,
+            inner: __private::Accessor<#model_name>,
             #(#jsonb_struct_fields),*
+        }
+
+        impl std::ops::Deref for #accessor_struct {
+            type Target = __private::Accessor<#model_name>;
+
+            fn deref(&self) -> &Self::Target {
+                &self.inner
+            }
         }
 
         impl std::fmt::Debug for #accessor_struct {
@@ -282,155 +199,34 @@ pub fn generate_accessor(model: &Model) -> TokenStream {
 
         impl #accessor_struct {
             pub fn new(pool: ConnectionPool) -> Self {
-                Self { pool: pool.clone(), #(#jsonb_inits),* }
-            }
-
-            pub fn query(&self) -> #query_builder {
-                #query_builder::new(self.pool.clone())
-            }
-
-            pub async fn find_many<F>(&self, f: F) -> Result<Vec<#model_name>, Box<dyn std::error::Error + Send + Sync>>
-            where
-                F: FnOnce(#where_builder) -> #where_builder,
-            {
-                let builder = f(#where_builder::new());
-                #query_builder::from_builder(self.pool.clone(), builder).await
-            }
-
-            pub async fn find_first<F>(&self, f: F) -> Result<Option<#model_name>, Box<dyn std::error::Error + Send + Sync>>
-            where
-                F: FnOnce(#where_builder) -> #where_builder,
-            {
-                let builder = f(#where_builder::new());
-                #query_builder::from_builder(self.pool.clone(), builder).first().await
-            }
-
-            pub async fn sum<F, T>(&self, f: F, field: &str) -> Result<T, Box<dyn std::error::Error + Send + Sync>>
-            where
-                F: FnOnce(#where_builder) -> #where_builder,
-                T: for<'a> tokio_postgres::types::FromSql<'a> + Default + tokio_postgres::types::ToSql + Sync,
-            {
-                let builder = f(#where_builder::new());
-                #query_builder::from_builder(self.pool.clone(), builder).sum(field).await
-            }
-
-            pub async fn count<F>(&self, f: F) -> Result<i64, Box<dyn std::error::Error + Send + Sync>>
-            where
-                F: FnOnce(#where_builder) -> #where_builder,
-            {
-                let builder = f(#where_builder::new());
-                #query_builder::from_builder(self.pool.clone(), builder).count().await
-            }
-
-            pub async fn avg<F, T>(&self, f: F, field: &str) -> Result<Option<T>, Box<dyn std::error::Error + Send + Sync>>
-            where
-                F: FnOnce(#where_builder) -> #where_builder,
-                T: for<'a> tokio_postgres::types::FromSql<'a>,
-            {
-                let builder = f(#where_builder::new());
-                #query_builder::from_builder(self.pool.clone(), builder).avg::<T>(field).await
-            }
-
-            pub async fn min<F, T>(&self, f: F, field: &str) -> Result<Option<T>, Box<dyn std::error::Error + Send + Sync>>
-            where
-                F: FnOnce(#where_builder) -> #where_builder,
-                T: for<'a> tokio_postgres::types::FromSql<'a>,
-            {
-                let builder = f(#where_builder::new());
-                #query_builder::from_builder(self.pool.clone(), builder).min::<T>(field).await
-            }
-
-            pub async fn max<F, T>(&self, f: F, field: &str) -> Result<Option<T>, Box<dyn std::error::Error + Send + Sync>>
-            where
-                F: FnOnce(#where_builder) -> #where_builder,
-                T: for<'a> tokio_postgres::types::FromSql<'a>,
-            {
-                let builder = f(#where_builder::new());
-                #query_builder::from_builder(self.pool.clone(), builder).max::<T>(field).await
+                Self { inner: __private::Accessor::new(pool.clone()), #(#jsonb_inits),* }
             }
 
             #typed_agg_methods
 
-            pub fn update<F>(&self, f: F) -> #update_builder
-            where
-                F: FnOnce(#update_builder) -> #update_builder,
-            {
-                let builder = #update_builder::new(self.pool.clone());
-                f(builder)
-            }
-
-            pub fn upsert<F>(&self, f: F) -> #upsert_builder
-            where
-                F: FnOnce(#upsert_builder) -> #upsert_builder,
-            {
-                let builder = #upsert_builder::new(self.pool.clone());
-                f(builder)
-            }
-
-            pub fn create<F>(&self, f: F) -> #create_builder
-            where
-                F: FnOnce(#create_builder) -> #create_builder,
-            {
-                let builder = #create_builder::new(self.pool.clone());
-                f(builder)
-            }
-
-            pub fn delete<F>(&self, f: F) -> #delete_builder
-            where
-                F: FnOnce(#delete_builder) -> #delete_builder,
-            {
-                let builder = #delete_builder::new(self.pool.clone());
-                f(builder)
-            }
-
-            pub async fn create_many(&self, records: Vec<std::collections::HashMap<&'static str, Box<dyn tokio_postgres::types::ToSql + Sync + Send>>>)
-                -> Result<u64, Box<dyn std::error::Error + Send + Sync>>
-            {
-                __private::insert_many(self.pool.clone(), #table_name, records).await
-            }
-
-            pub async fn upsert_many<T, K, FC, FU>(
+            pub fn upsert_many<T, K, FC, FU>(
                 &self,
                 records: Vec<T>,
                 conflict: impl FnOnce(#conflict_selector) -> K,
-                mut create: FC,
-                mut update: FU,
-            ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>
+                create: FC,
+                update: FU,
+            ) -> impl std::future::Future<Output = Result<u64, Box<dyn std::error::Error + Send + Sync>>>
             where
                 T: Clone,
                 K: #conflict_target,
                 FC: FnMut(#create_builder, T) -> #create_builder,
                 FU: FnMut(#update_builder, T) -> #update_builder,
             {
-                if records.is_empty() {
-                    return Ok(0);
-                }
-
-                let mut batch = __private::UpsertBatch::new(
-                    #table_name,
-                    <#model_name as crate::ModelMeta>::COLUMNS,
-                    conflict(#conflict_selector::new()).columns(),
-                )?;
-
-                for record in records {
-                    let create_builder = create(#create_builder::new(self.pool.clone()), record.clone());
-                    let update_builder = update(#update_builder::new(self.pool.clone()), record);
-                    batch.push(create_builder, update_builder)?;
-                }
-
-                batch.execute(self.pool.clone()).await
+                self.upsert_many_by(
+                    records,
+                    move || conflict(#conflict_selector::new()).columns(),
+                    create,
+                    update,
+                )
             }
 
             #find_unique
             #find_or_create
-
-            pub async fn get_client(&self) -> Result<PooledClient, tokio_postgres::Error> {
-                self.pool.get().await
-            }
-
-            pub fn pool(&self) -> &ConnectionPool {
-                &self.pool
-            }
         }
     }
 }

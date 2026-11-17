@@ -90,6 +90,25 @@ pub fn sql_arg_expr(type_name: &str, nullable: bool, value: TokenStream) -> Toke
     }
 }
 
+pub fn sql_arg_ctor(type_name: &str, nullable: bool) -> TokenStream {
+    if nullable {
+        return quote! { __private::SqlArg::boxed };
+    }
+
+    match type_name {
+        "BigInt" => quote! { __private::SqlArg::I64 },
+        "Int" | "Serial" => quote! { __private::SqlArg::I32 },
+        "String" | "Text" => quote! { __private::SqlArg::Text },
+        "JsonB" | "Jsonb" => quote! { __private::SqlArg::Json },
+        "TimestamptZ" | "Timestamp" => quote! { __private::SqlArg::Timestamp },
+        "Date" => quote! { __private::SqlArg::Date },
+        "Boolean" => quote! { __private::SqlArg::Bool },
+        "Float" => quote! { __private::SqlArg::F64 },
+        "Real" => quote! { __private::SqlArg::F32 },
+        _ => quote! { __private::SqlArg::boxed },
+    }
+}
+
 pub fn generate_select_columns(model: &Model) -> String {
     model
         .fields
@@ -296,14 +315,7 @@ pub fn supports_comparisons(type_name: &str) -> bool {
     )
 }
 
-pub fn generate_filter_methods<'a>(
-    model: &'a Model,
-    filters_expr: &'a str,
-) -> impl Iterator<Item = TokenStream> + 'a {
-    let filters: TokenStream = filters_expr
-        .parse()
-        .expect("filters expression must be valid Rust");
-
+pub fn generate_filter_methods<'a>(model: &'a Model) -> impl Iterator<Item = TokenStream> + 'a {
     model.fields.iter().flat_map(move |field| {
         let snake = to_snake_case(&field.name);
         let method_name = format_ident!("where_{}", snake);
@@ -314,24 +326,18 @@ pub fn generate_filter_methods<'a>(
             .any(|m| matches!(m, Modifier::Nullable));
         let field_type = rust_type_from_schema(&field.type_name, is_nullable);
         let field_col = snake.clone();
-        let filters = filters.clone();
         let arg = sql_arg_expr(&field.type_name, is_nullable, quote! { value });
+        let ctor = sql_arg_ctor(&field.type_name, is_nullable);
 
         let mut methods = vec![
             quote! {
-                pub fn #method_name(mut self, value: #field_type) -> Self {
-                    self.#filters.push(#field_col, WhereOp::Eq, #arg);
-                    self
+                pub fn #method_name(self, value: #field_type) -> Self {
+                    self.__filter(#field_col, WhereOp::Eq, #arg)
                 }
             },
             quote! {
-                pub fn #method_in(mut self, values: Vec<#field_type>) -> Self {
-                    let values: Vec<__private::SqlArg> = values
-                        .into_iter()
-                        .map(|value| #arg)
-                        .collect();
-                    self.#filters.push_in(#field_col, values);
-                    self
+                pub fn #method_in(self, values: Vec<#field_type>) -> Self {
+                    self.__filter_in(#field_col, values.into_iter().map(#ctor).collect())
                 }
             },
         ];
@@ -339,18 +345,14 @@ pub fn generate_filter_methods<'a>(
         if is_nullable {
             let method_is_null = format_ident!("where_{}_is_null", snake);
             let method_is_not_null = format_ident!("where_{}_is_not_null", snake);
-            let filters_null = filters.clone();
-            let filters_not_null = filters.clone();
             methods.push(quote! {
-                pub fn #method_is_null(mut self) -> Self {
-                    self.#filters_null.push_bare(#field_col, WhereOp::IsNull);
-                    self
+                pub fn #method_is_null(self) -> Self {
+                    self.__filter_bare(#field_col, WhereOp::IsNull)
                 }
             });
             methods.push(quote! {
-                pub fn #method_is_not_null(mut self) -> Self {
-                    self.#filters_not_null.push_bare(#field_col, WhereOp::IsNotNull);
-                    self
+                pub fn #method_is_not_null(self) -> Self {
+                    self.__filter_bare(#field_col, WhereOp::IsNotNull)
                 }
             });
         }
@@ -365,12 +367,10 @@ pub fn generate_filter_methods<'a>(
             methods.extend(comparisons.into_iter().map(|(method, op)| {
                 let field_type = field_type.clone();
                 let field_col = field_col.clone();
-                let filters = filters.clone();
                 let arg = arg.clone();
                 quote! {
-                    pub fn #method(mut self, value: #field_type) -> Self {
-                        self.#filters.push(#field_col, WhereOp::#op, #arg);
-                        self
+                    pub fn #method(self, value: #field_type) -> Self {
+                        self.__filter(#field_col, WhereOp::#op, #arg)
                     }
                 }
             }));
